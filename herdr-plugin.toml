@@ -1,0 +1,18 @@
+id = "simpikkle.tasks"
+name = "Task Board"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Track GitHub issues through created → research → code → testing → released"
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "board"
+title = "Task board"
+placement = "tab"
+command = ["python3", "tasks", "board"]
+
+[[actions]]
+id = "open-board"
+title = "Open task board"
+contexts = ["workspace"]
+command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint board --focus"]

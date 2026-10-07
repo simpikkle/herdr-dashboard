@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Track GitHub issues through created → research → code → testing → released."""
+import argparse, fcntl, json, os, re, select, shutil, subprocess, sys, termios, time, tty
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+STATUSES = ["created", "research", "code", "testing", "released"]
+COLORS = {"created": 90, "research": 34, "code": 33, "testing": 35, "released": 32}
+STORE = os.path.expanduser(os.environ.get("TASKS_FILE", "~/.local/state/herdr-tasks/tasks.json"))
+SELF = os.path.realpath(__file__)
+HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
+
+
+def sh(*cmd, check=True):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if check and r.returncode:
+        sys.exit(f"{' '.join(cmd[:3])}…: {r.stderr.strip() or r.stdout.strip()}")
+    return r.stdout
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load():
+    try:
+        with open(STORE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"tasks": {}}
+
+
+@contextmanager
+def store():
+    os.makedirs(os.path.dirname(STORE), exist_ok=True)
+    with open(STORE + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = load()
+        yield data
+        tmp = STORE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, STORE)
+
+
+def resolve(ref, repo=None):
+    m = re.fullmatch(r"(?:([\w.-]+/[\w.-]+))?#?(\d+)", ref)
+    if not m:
+        sys.exit(f"bad issue ref {ref!r}: use 42, #42 or owner/repo#42")
+    repo = m[1] or repo or sh("gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").strip()
+    return repo, int(m[2])
+
+
+def transition(data, key, status, note=None):
+    pane = os.environ.get("HERDR_PANE_ID")
+    entry = {k: v for k, v in dict(status=status, at=now(), pane=pane, note=note).items() if v}
+    data["tasks"][key]["history"].append(entry)
+    if pane:
+        sh(HERDR, "pane", "report-metadata", pane, "--source", "simpikkle.tasks",
+           "--custom-status", f"#{key.split('#')[1]} {status}", check=False)
+
+
+def ensure(data, repo, num):
+    key = f"{repo}#{num}"
+    if key not in data["tasks"]:
+        info = json.loads(sh("gh", "issue", "view", str(num), "-R", repo, "--json", "title,url"))
+        data["tasks"][key] = dict(repo=repo, number=num, **info, history=[])
+        transition(data, key, "created")
+    return key
+
+
+def cmd_add(a):
+    with store() as data:
+        print(ensure(data, *resolve(a.issue, a.repo)))
+
+
+def cmd_set(a):
+    with store() as data:
+        key = ensure(data, *resolve(a.issue, a.repo))
+        transition(data, key, a.status, a.note)
+    print(f"{key} → {a.status}")
+
+
+def cmd_start(a):
+    repo, num = resolve(a.issue, a.repo)
+    with store() as data:
+        key = ensure(data, repo, num)
+        task = data["tasks"][key]
+    split = json.loads(sh(HERDR, "pane", "split", "--current", "--direction", a.direction,
+                          "--cwd", os.getcwd(), "--no-focus"))
+    pane, name = split["result"]["pane"]["pane_id"], f"issue-{num}"
+    sh(HERDR, "agent", "start", name, "--kind", a.kind, "--pane", pane)
+    with store() as data:
+        os.environ["HERDR_PANE_ID"] = pane
+        transition(data, key, "research")
+    sh(HERDR, "agent", "prompt", name,
+       f"Work on GitHub issue {task['url']} ({task['title']}). Read it with `gh issue view {num} -R {repo}`. "
+       f"Report your phase whenever it changes by running `{SELF} set {key} <status>`, where status is "
+       f"`research` while investigating, `code` once you start changing code, and `testing` while verifying. "
+       f"Never set `released`; I do that.")
+    print(f"{key}: agent {name} started in {pane}")
+
+
+def ago(iso):
+    s = int((datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds())
+    return next(f"{s // d}{u}" for d, u in ((86400, "d"), (3600, "h"), (60, "m"), (1, "s")) if s >= d or u == "s")
+
+
+def paint(status, text):
+    return f"\033[{COLORS[status]}m{text}\033[0m"
+
+
+def agent_states():
+    try:
+        return {p["pane_id"]: p.get("agent_status") for p in json.loads(sh(HERDR, "pane", "list", check=False))["result"]["panes"]}
+    except Exception:
+        return {}
+
+
+LABEL, GAP = 14, 12  # x of the first stage column, distance between stage columns
+DIM, BOLD = "\033[2m{}\033[0m", "\033[1;4m{}\033[0m"
+
+
+def rail(label=""):
+    """A spacer line: optional project label, then a dotted rail under every stage it doesn't overlap."""
+    rest = (" " * LABEL + ("┆" + " " * (GAP - 1)) * len(STATUSES)).rstrip()
+    return (BOLD.format(label) if label else "") + DIM.format(rest[len(label):])
+
+
+def render():
+    tasks, live = load()["tasks"].values(), agent_states()
+    try:  # ask the tty: a stale COLUMNS env from pane spawn would win in shutil
+        cols = os.get_terminal_size(sys.stdout.fileno()).columns
+    except OSError:
+        cols = shutil.get_terminal_size().columns
+    header = [" "] * (LABEL + GAP * len(STATUSES))
+    for i, s in enumerate(STATUSES):
+        x = LABEL + i * GAP - len(s) // 2
+        header[x:x + len(s)] = s
+    out = ["\033[1mTask board\033[0m", "", "".join(header).rstrip()]
+    projects = {}
+    for t in sorted(tasks, key=lambda t: t["history"][-1]["at"], reverse=True):
+        projects.setdefault(t["repo"], []).append(t)
+    for repo, issues in projects.items():
+        out += [rail(), rail(repo.split("/")[-1])]
+        for t in sorted(issues, key=lambda t: t["number"]):
+            cur = t["history"][-1]
+            n, row = STATUSES.index(cur["status"]), f"    #{t['number']}".ljust(LABEL)
+            for i, s in enumerate(STATUSES):
+                if i:
+                    row += paint(s, "─" * (GAP - 1)) if i <= n else DIM.format("─" * (GAP - 1))
+                row += paint(s, "●") if i <= n else DIM.format("○")
+            agent = live.get(next((e["pane"] for e in reversed(t["history"]) if e.get("pane")), None))
+            info = f"{t['title']} · {cur['status']} {ago(cur['at'])}" + (f" · agent {agent}" if agent else "")
+            out += [rail(), row + DIM.format("  " + info[:max(0, cols - LABEL - GAP * 4 - 3)])]
+    return out + [rail()]
+
+
+def cmd_board(a):
+    if a.once or not sys.stdin.isatty():
+        return print("\n".join(render()))
+    fd, old = sys.stdin.fileno(), termios.tcgetattr(sys.stdin)
+    tty.setcbreak(fd)
+    sys.stdout.write("\033[?1049h\033[?25l")
+    try:
+        while True:
+            sys.stdout.write("\033[H\033[2J" + "\n".join(render()) + "\n\n\033[90mq to quit\033[0m")
+            sys.stdout.flush()
+            if select.select([sys.stdin], [], [], 2)[0] and sys.stdin.read(1) == "q":
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[?25h\033[?1049l")
+
+
+p = argparse.ArgumentParser(description=__doc__)
+sub = p.add_subparsers(required=True)
+for name, fn, extra in [("add", cmd_add, []), ("set", cmd_set, ["status"]), ("start", cmd_start, [])]:
+    s = sub.add_parser(name)
+    s.add_argument("issue", help="42, #42 or owner/repo#42")
+    if extra:
+        s.add_argument("status", choices=STATUSES)
+        s.add_argument("--note")
+    s.add_argument("--repo", help="owner/repo (default: repo of the current directory)")
+    s.set_defaults(fn=fn)
+start = sub.choices["start"]
+start.add_argument("--kind", default="claude")
+start.add_argument("--direction", choices=["right", "down"], default="right")
+b = sub.add_parser("board")
+b.add_argument("--once", action="store_true")
+b.set_defaults(fn=cmd_board)
+a = p.parse_args()
+a.fn(a)
