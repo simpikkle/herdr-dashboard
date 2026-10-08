@@ -6,10 +6,11 @@ from datetime import datetime, timezone
 
 STATUSES = ["created", "research", "code", "testing", "pr", "merged"]
 DONE = "\033[1;92m{}\033[0m"  # bold bright green for reached stages
-STORE = os.path.expanduser(os.environ.get("TASKS_FILE", "~/.local/state/herdr-tasks/tasks.json"))
+STORE = os.path.expanduser(os.environ.get("DASHBOARD_FILE", "~/.local/state/herdr-dashboard/tasks.json"))
 SELF = os.path.realpath(__file__)
-try:  # personal settings in a gitignored .env next to the script; real environment variables win
-    with open(os.path.join(os.path.dirname(SELF), ".env")) as f:
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "herdr-dashboard", "config")
+try:  # KEY=value settings; real environment variables win
+    with open(CONFIG) as f:
         for line in f:
             k, sep, v = line.strip().partition("=")
             if sep and not k.startswith("#"):
@@ -18,8 +19,8 @@ except FileNotFoundError:
     pass
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
 DONE_SECTION, DONE_DAYS = "Done", 14  # merged tasks are listed here, newest first, for this many days
-JQL = os.environ.get("TASKS_JIRA_JQL", "assignee = currentUser() AND statusCategory != Done AND issuetype != Epic")
-START_DIR = os.environ.get("TASKS_START_DIR", "~")  # where `start --workspace` opens, and repos are looked for
+JQL = os.environ.get("DASHBOARD_JIRA_JQL", "assignee = currentUser() AND statusCategory != Done AND issuetype != Epic")
+START_DIR = os.environ.get("DASHBOARD_START_DIR", "~")  # where `start --workspace` opens, and repos are looked for
 SYNC_EVERY = 300  # seconds between Jira syncs while the board is open
 
 INSTRUCTIONS = f"""This Claude session runs in a Herdr pane that is tracked on a task board. Keep the board current with:
@@ -99,7 +100,7 @@ def transition(data, key, status, pane=None, note=None):
     entry = {k: v for k, v in dict(status=status, at=now(), pane=pane, note=note).items() if v}
     data["tasks"][key]["history"].append(entry)
     if pane:
-        sh(HERDR, "pane", "report-metadata", pane, "--source", "simpikkle.tasks",
+        sh(HERDR, "pane", "report-metadata", pane, "--source", "simpikkle.dashboard",
            "--custom-status", " ".join(filter(None, [label(key, data["tasks"][key]), status])), check=False)
 
 
@@ -242,6 +243,56 @@ def sync_jira(jql):
     print(f"{len(issues)} issues, added {len(added)}" + (f": {' '.join(added)}" if added else ""))
 
 
+def cmd_setup(a):
+    """Put `dashboard` on PATH and add the Claude Code hooks. Safe to run again."""
+    link = os.path.expanduser("~/.local/bin/dashboard")
+    os.makedirs(os.path.dirname(link), exist_ok=True)
+    if os.path.islink(link) or not os.path.exists(link):
+        if os.path.islink(link):
+            os.remove(link)
+        os.symlink(SELF, link)
+        print(f"linked {link} → {SELF}")
+    else:
+        print(f"{link} exists and isn't a link; left it alone")
+    if os.path.dirname(link) not in os.environ.get("PATH", "").split(os.pathsep):
+        print(f"add {os.path.dirname(link)} to your PATH")
+
+    path = os.path.expanduser("~/.claude/settings.json")
+    try:
+        with open(path) as f:
+            settings = json.load(f)
+    except FileNotFoundError:
+        settings = {}
+    hooks, changed = settings.setdefault("hooks", {}), False
+    for event, sub in [("SessionStart", "session"), ("UserPromptSubmit", "prompt")]:
+        entries = hooks.setdefault(event, [])
+        if not any(f"dashboard hook {sub}" in h.get("command", "") for e in entries for h in e.get("hooks", [])):
+            entries.append({"hooks": [{"type": "command", "command": f"{link} hook {sub}", "timeout": 10}]})
+            changed = True
+    if changed:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path):
+            shutil.copy(path, path + ".bak")
+        with open(path, "w") as f:
+            json.dump(settings, f, indent=2)
+            f.write("\n")
+        print(f"added Claude Code hooks to {path}" + (f" (backup: {path}.bak)" if os.path.exists(path + ".bak") else ""))
+    else:
+        print("Claude Code hooks already set up")
+    print(f"""
+Optional: bind a key to the board popup in Herdr's config.toml:
+
+[[keys.command]]
+key = "prefix+d"
+type = "plugin_action"
+command = "simpikkle.dashboard.board-popup"
+description = "dashboard"
+
+Settings go in {CONFIG}.""")
+    if a.wait:
+        input("\nEnter to close")
+
+
 def cmd_rename(a):
     with store() as data:
         key = resolve(a.ref, a.repo)
@@ -304,7 +355,7 @@ def cmd_start(a):
 
 def cmd_enroll(a):
     """Interactive: link a pane (default: the one the action was invoked on) to a task."""
-    pane = a.pane or os.environ.get("TASKS_PANE") or os.environ.get("HERDR_PANE_ID")
+    pane = a.pane or os.environ.get("DASHBOARD_PANE") or os.environ.get("HERDR_PANE_ID")
     if not pane:
         sys.exit("no pane to enroll")
     info = json.loads(sh(HERDR, "pane", "get", pane))["result"]["pane"]
@@ -605,8 +656,9 @@ for name, fn, help in [("add", cmd_add, "track a ticket without starting an agen
     s.add_argument("ref", help=REF)
 sub.choices["start"].add_argument("--kind", default="claude")
 sub.choices["start"].add_argument("--direction", choices=["right", "down"], default="right")
-sub.choices["start"].add_argument("--workspace", action="store_true", help="open a new workspace in TASKS_START_DIR instead of splitting this pane")
-cmd("sync", cmd_sync, "add Jira issues matching a JQL query (default: TASKS_JIRA_JQL or your open non-epic issues) and refresh PR status").add_argument("--jql", default=JQL)
+sub.choices["start"].add_argument("--workspace", action="store_true", help="open a new workspace in DASHBOARD_START_DIR instead of splitting this pane")
+cmd("sync", cmd_sync, "add Jira issues matching a JQL query (default: DASHBOARD_JIRA_JQL or your open non-epic issues) and refresh PR status").add_argument("--jql", default=JQL)
+cmd("setup", cmd_setup, "put dashboard on PATH and add the Claude Code hooks").add_argument("--wait", action="store_true")
 cmd("rm", cmd_rm, "stop tracking a task").add_argument("ref", help=REF)
 s = cmd("rename", cmd_rename, "change a task's title")
 s.add_argument("ref", help=REF)

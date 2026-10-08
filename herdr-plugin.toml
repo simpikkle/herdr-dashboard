@@ -1,5 +1,5 @@
-id = "simpikkle.tasks"
-name = "Task Board"
+id = "simpikkle.dashboard"
+name = "Dashboard"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
 description = "Track GitHub issues, Jira tickets and untitled work through created → research → code → testing → pr → merged"
@@ -7,27 +7,27 @@ platforms = ["linux", "macos"]
 
 [[panes]]
 id = "board"
-title = "Task board"
+title = "Dashboard"
 placement = "tab"
-command = ["python3", "tasks", "board"]
+command = ["python3", "dashboard", "board"]
 
 [[panes]]
 id = "board-popup"
-title = "Task board"
+title = "Dashboard"
 placement = "popup"
 width = "90%"
 height = "80%"
-command = ["python3", "tasks", "board", "--popup"]
+command = ["python3", "dashboard", "board", "--popup"]
 
 [[actions]]
 id = "board-popup"
-title = "Show task board (popup)"
+title = "Show dashboard (popup)"
 contexts = ["workspace"]
 command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint board-popup"]
 
 [[actions]]
 id = "open-board"
-title = "Open task board"
+title = "Open dashboard"
 contexts = ["workspace"]
 command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint board --focus"]
 
@@ -37,10 +37,24 @@ title = "Enroll pane"
 placement = "popup"
 width = "70%"
 height = 12
-command = ["python3", "tasks", "enroll"]
+command = ["python3", "dashboard", "enroll"]
 
 [[actions]]
 id = "enroll"
-title = "Enroll pane in task board"
+title = "Enroll pane in dashboard"
 contexts = ["workspace"]
-command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint enroll --env TASKS_PANE=\"$HERDR_PANE_ID\""]
+command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint enroll --env DASHBOARD_PANE=\"$HERDR_PANE_ID\""]
+
+[[panes]]
+id = "setup"
+title = "Dashboard setup"
+placement = "popup"
+width = "70%"
+height = 24
+command = ["python3", "dashboard", "setup", "--wait"]
+
+[[actions]]
+id = "setup"
+title = "Set up dashboard (CLI and Claude Code hooks)"
+contexts = ["workspace"]
+command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint setup"]

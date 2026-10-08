@@ -1,92 +1,30 @@
-# Task Board
+# herdr-dashboard
 
-A [Herdr](https://herdr.dev) plugin that tracks GitHub issues, Jira tickets and untitled work through
-`created → research → code → testing → pr → merged`, furthest along first.
+A task board for [Herdr](https://herdr.dev): your GitHub issues, Jira tickets and Claude Code sessions,
+from `created` to `merged`, with the tabs working on each one.
 
 ```
-           created    research      code       testing    released
-              ┆           ┆           ┆           ┆           ┆
-herdr         ┆           ┆           ┆           ┆           ┆
-              ┆           ┆           ┆           ┆           ┆
-    #2        ●───────────●───────────●───────────●───────────○  pi shows momentarily as codex · testing 10m
+              created  research    code     testing     pr      merged
+    PROJ-142     ●━━━━━━━━━●━━━━━━━━━●━━━━━━━━━●━━━━━━━━━●─────────○  Retry failed uploads · 2h · PR #318 · CI failing
+                 ┆         ┆         ┆         ┆         ┆         ┆  ↳ ◐ upload retry backoff
+    api#57       ●━━━━━━━━━●━━━━━━━━━●─────────○─────────○─────────○  Rate limit headers · 40m
+    PROJ-150     ●─────────○─────────○─────────○─────────○─────────○  Dark mode toggle · Oct 7 (Wed) · ▶ start
 ```
 
 ## Install
 
-Needs Herdr 0.7+, Python 3.9+, an authenticated `gh`, and the `jira` CLI for Jira tickets.
+Needs Herdr 0.7+, Python 3.9+, [`gh`](https://cli.github.com), and [`jira`](https://github.com/ankitpokhrel/jira-cli) for Jira.
 
 ```bash
-git clone git@github.com:simpikkle/herdr-custom.git && cd herdr-custom
-herdr plugin link "$PWD"
-ln -s## Use
-
-```bash
-tasks set code PROJ-123              # move a task to a stage; links the calling pane to it
-tasks set testing                    # update the task linked to this pane
-tasks set code PROJ-123 --force      # stages only move forward unless forced
-tasks set code --title "Fix login"   # task without a ticket
-tasks set pr --pr <url>
-tasks set merged owner/repo#42 --detached --note "deployed"   # from another pane, without linking it
-tasks start 42                       # split a pane, start an agent on issue #42 of the current repo
-tasks start PROJ-123 --workspace     # new workspace in TASKS_START_DIR (default ~) with a "research" tab
-tasks add PROJ-123                   # track a ticket without starting an agent
-tasks list [--json]                  # e.g. for an agent that follows PRs
-tasks sync [--jql "..."]             # add Jira issues not tracked yet, refresh PR status (the board does this every 5 min)
-tasks rename task-7 "Fix login"
-tasks rm task-7
-herdr plugin action invoke board-popup  # board as a popup (esc closes it; jumping to a task closes it too)
-herdr plugin action invoke open-board   # board in its own tab (q closes it)
-herdr plugin action invoke enroll       # popup: link the focused pane to a ticket
+herdr plugin install simpikkle/herdr-dashboard
+herdr plugin action invoke simpikkle.dashboard.setup   # puts `dashboard` on PATH, adds the Claude Code hooks
 ```
 
-Refs can be `42`, `#42`, `owner/repo#42`, an issue URL, a Jira key or URL, or `task-7`
-(tasks without a ticket). Linking a pane's untitled task to a ticket folds it into the ticket.
-Tasks are listed by stage, furthest along first, then by most recent change.
-Tasks merged in the last 2 weeks are listed under "Done", newest first.
+## Use
 
-Settings are environment variables; they can also go in a `.env` file next to `tasks` (gitignored):
+Open the board with `herdr plugin action invoke simpikkle.dashboard.board-popup` (or bind it to a key; setup shows how).
+Click a task to jump to its tab, a ticket ID or `PR #…` to open it, `▶ start` to start work on it.
 
-```bash
-TASKS_START_DIR=~/code          # where `start --workspace` opens and Claude looks for the repo (default ~)
-TASKS_JIRA_JQL=project = PROJ AND assignee = currentUser() AND statusCategory != Done
-TASKS_FILE=~/.local/state/herdr-tasks/tasks.json
-```
-`tasks sync` adds Jira issues matching `TASKS_JIRA_JQL` (default: your open issues, without epics).
-It also checks each task's PR: review decision and CI state show on the board, and merged PRs move the task to `merged`.
-State lives in `~/.local/state/herdr-tasks/tasks.json` (override with `TASKS_FILE`).
+Claude Code sessions in Herdr show up on their own and keep their stage up to date.
 
-## Automatic tracking with Claude Code
-
-Add to `~/.claude/settings.json`:
-
-```json
-"hooks": {
-  "SessionStart": [{"matcher": "*", "hooks": [{"type": "command", "command": "python3 ~/.local/bin/tasks hook session"}]}],
-  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 ~/.local/bin/tasks hook prompt"}]}]
-}
-```
-
-Inside Herdr, the first prompt of each Claude session creates an untitled task for its pane
-(shown on the board under Claude's session title until it gets a ticket or a title),
-and Claude is told to link it to the ticket and report its stage, up to `pr`.
-It never sets `merged`, and never uses `--force` without asking you.
-
-To bind keys, add to Herdr's `config.toml`:
-
-```toml
-[[keys.command]]
-key = "prefix+d"
-type = "plugin_action"
-command = "simpikkle.tasks.board-popup"
-description = "task board"
-
-[[keys.command]]
-key = "prefix+t"
-type = "plugin_action"
-command = "simpikkle.tasks.enroll"
-description = "enroll pane in task board"
-```
-
-On the board, `↑`/`↓` or `j`/`k` select a task, `Enter` or a click jumps to its tab, `o` or a click on
-`PR #…` opens the PR, a click on a ticket ID opens the ticket, a click on `▶ start` (tickets not started yet)
-runs `tasks start --workspace` for it, `s` syncs Jira.
+See [USAGE.md](USAGE.md) for the CLI, settings and details.
