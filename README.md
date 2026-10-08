@@ -1,7 +1,7 @@
 # Task Board
 
 A [Herdr](https://herdr.dev) plugin that tracks GitHub issues, Jira tickets and untitled work through
-`created → research → code → testing → pr → merged`, grouped by project.
+`created → research → code → testing → pr → merged`, furthest along first.
 
 ```
            created    research      code       testing    released
@@ -25,7 +25,7 @@ tasks set code PROJ-123              # move a task to a stage; links the calling
 tasks set testing                    # update the task linked to this pane
 tasks set code PROJ-123 --force      # stages only move forward unless forced
 tasks set code --title "Fix login"   # task without a ticket
-tasks set pr --pr <url> --project Auth
+tasks set pr --pr <url>
 tasks set merged owner/repo#42 --detached --note "deployed"   # from another pane, without linking it
 tasks start 42                       # split a pane, start an agent on issue #42 of the current repo
 tasks start PROJ-123 --workspace     # new workspace in TASKS_START_DIR (default ~) with a "research" tab
@@ -41,7 +41,7 @@ herdr plugin action invoke enroll       # popup: link the focused pane to a tick
 
 Refs can be `42`, `#42`, `owner/repo#42`, an issue URL, a Jira key or URL, or `task-7`
 (tasks without a ticket). Linking a pane's untitled task to a ticket folds it into the ticket.
-Tasks are grouped by `--project`; tasks without one, or without a real ticket, go under "Other".
+Tasks are listed by stage, furthest along first, then by most recent change.
 Tasks merged in the last 2 weeks are listed under "Done", newest first.
 
 Settings are environment variables; they can also go in a `.env` file next to `tasks` (gitignored):
@@ -51,8 +51,7 @@ TASKS_START_DIR=~/code          # where `start --workspace` opens and Claude loo
 TASKS_JIRA_JQL=project = PROJ AND assignee = currentUser() AND statusCategory != Done
 TASKS_FILE=~/.local/state/herdr-tasks/tasks.json
 ```
-`tasks sync` adds Jira issues matching `TASKS_JIRA_JQL` (default: your open issues, without epics);
-bugs go under "Bugs" and other issues under their parent epic, unless they already have a project.
+`tasks sync` adds Jira issues matching `TASKS_JIRA_JQL` (default: your open issues, without epics).
 It also checks each task's PR: review decision and CI state show on the board, and merged PRs move the task to `merged`.
 State lives in `~/.local/state/herdr-tasks/tasks.json` (override with `TASKS_FILE`).
 
@@ -69,7 +68,7 @@ Add to `~/.claude/settings.json`:
 
 Inside Herdr, the first prompt of each Claude session creates an untitled task for its pane
 (shown on the board under Claude's session title until it gets a ticket or a title),
-and Claude is told to link it to the ticket, infer a project and report its stage, up to `pr`.
+and Claude is told to link it to the ticket and report its stage, up to `pr`.
 It never sets `merged`, and never uses `--force` without asking you.
 
 To bind keys, add to Herdr's `config.toml`:

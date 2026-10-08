@@ -17,17 +17,15 @@ try:  # personal settings in a gitignored .env next to the script; real environm
 except FileNotFoundError:
     pass
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
-NO_PROJECT = "Other"  # tasks without a project or without a real ticket
 DONE_SECTION, DONE_DAYS = "Done", 14  # merged tasks are listed here, newest first, for this many days
 JQL = os.environ.get("TASKS_JIRA_JQL", "assignee = currentUser() AND statusCategory != Done AND issuetype != Epic")
 START_DIR = os.environ.get("TASKS_START_DIR", "~")  # where `start --workspace` opens, and repos are looked for
 SYNC_EVERY = 300  # seconds between Jira syncs while the board is open
 
 INSTRUCTIONS = f"""This Claude session runs in a Herdr pane that is tracked on a task board. Keep the board current with:
-  {SELF} set <stage> [ref] [--title T] [--project P] [--pr URL] [--note N]
+  {SELF} set <stage> [ref] [--title T] [--pr URL] [--note N]
 - ref: GitHub issue (42, owner/repo#42, issue URL) or Jira key (PROJ-123). Omit it to update this pane's task.
 - As soon as you know the ticket for the work, run `set <stage> <ref>`; that links this pane's task to it. Work with no ticket: omit ref and give a short --title.
-- Pass --project with the feature or initiative the work belongs to, in a few words (e.g. "Search redesign", "Billing v2 migration"). Work it out from the ticket, the branch name and recent commits. Never use the repo or directory name. Reuse a name from the existing projects below only when the work really belongs to that initiative, not because it matches the repo.
 - Stages: research (investigating), code (changing code), testing (verifying), pr (once you open a PR; pass --pr <url>). Never set merged.
 - Stages only move forward. Moving a task back needs --force: never pass it on your own; ask the user first and use it only if they say yes. If `set` refuses, leave the stage as it is.
 - Pick the stage from the state of the work, not from how the user phrases the request: check the branch, `git status`/`git diff` and whether a PR exists (`gh pr view`). Uncommitted or branch changes for the task mean at least `code`; an open PR means `pr`.
@@ -129,12 +127,10 @@ def bind(data, pane, key, session=None):
     if prev != key and prev in data["tasks"] and prev.startswith("task-") and not key.startswith("task-"):
         p, t = data["tasks"].pop(prev), data["tasks"][key]
         t["history"] = sorted(p["history"] + t["history"], key=lambda e: e["at"])
-        if p.get("project") and not t.get("project"):
-            t["project"] = p["project"]
     data["panes"][pane] = dict(old, task=key, **({"session": session} if session else {}))
 
 
-def apply(pane, status, ref=None, title=None, project=None, pr=None, note=None, repo=None, cwd=None, session=None, force=False):
+def apply(pane, status, ref=None, title=None, pr=None, note=None, repo=None, cwd=None, session=None, force=False):
     with store() as data:
         if ref:
             key = ensure(data, resolve(ref, repo, cwd))
@@ -149,7 +145,7 @@ def apply(pane, status, ref=None, title=None, project=None, pr=None, note=None, 
                 if pane:
                     bind(data, pane, key, session)
         t = data["tasks"][key]
-        t.update({k: v for k, v in dict(title=title, project=project, pr=pr).items() if v})
+        t.update({k: v for k, v in dict(title=title, pr=pr).items() if v})
         if title:
             t.pop("auto", None)
         was = t["history"][-1]["status"]
@@ -161,15 +157,13 @@ def apply(pane, status, ref=None, title=None, project=None, pr=None, note=None, 
 
 def cmd_set(a):
     pane = None if a.detached else os.environ.get("HERDR_PANE_ID")
-    key = apply(pane, a.status, a.ref, a.title, a.project, a.pr, a.note, a.repo, force=a.force)
+    key = apply(pane, a.status, a.ref, a.title, a.pr, a.note, a.repo, force=a.force)
     print(f"{key} → {a.status}")
 
 
 def cmd_add(a):
     with store() as data:
         key = ensure(data, resolve(a.ref, a.repo))
-        if a.project:
-            data["tasks"][key]["project"] = a.project
     print(key)
 
 
@@ -219,8 +213,7 @@ def sync_prs():
 
 
 def sync_jira(jql):
-    """Add Jira issues matching JQL that aren't tracked yet, refresh titles, and set a default project:
-    "Bugs" for bugs, otherwise the parent epic. A project set some other way is kept."""
+    """Add Jira issues matching JQL that aren't tracked yet and refresh titles."""
     try:
         r = subprocess.run(["jira", "issue", "list", "-q", jql, "--raw"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
     except FileNotFoundError:
@@ -233,28 +226,19 @@ def sync_jira(jql):
         issues = []
     view = lambda key: json.loads(sh("jira", "issue", "view", key, "--raw"))
     data = load()
-    epics, base = data.get("epics", {}), None
+    base = None
     for i in issues:
-        parent = (i["fields"].get("parent") or {}).get("key")
-        if parent and parent not in epics:
-            epics[parent] = view(parent)["fields"]["summary"]
         if i["key"] not in data["tasks"] and not base:
             base = view(i["key"])["self"].split("/rest/")[0]
     added = []
     with store() as data:
-        data["epics"] = epics
         for i in issues:
             key, summary = i["key"], i["fields"]["summary"]
-            epic = epics.get((i["fields"].get("parent") or {}).get("key"))
-            default = "Bugs" if i["fields"].get("issueType", {}).get("name") == "Bug" else epic
             if key not in data["tasks"]:
                 data["tasks"][key] = dict(title=summary, url=f"{base}/browse/{key}", history=[])
                 transition(data, key, "created")
                 added.append(key)
-            t = data["tasks"][key]
-            t["title"] = summary
-            if default and (not t.get("project") or t["project"] in epics.values()):
-                t["project"] = default
+            data["tasks"][key]["title"] = summary
     print(f"{len(issues)} issues, added {len(added)}" + (f": {' '.join(added)}" if added else ""))
 
 
@@ -273,7 +257,7 @@ def cmd_list(a):
     if a.json:
         return print(json.dumps(tasks, indent=2))
     for key, t in tasks.items():
-        print("\t".join([key, t["history"][-1]["status"], t.get("project", ""), t.get("pr", ""), t["title"]]))
+        print("\t".join([key, t["history"][-1]["status"], t.get("pr", ""), t["title"]]))
 
 
 def find(obj, field):
@@ -291,8 +275,6 @@ def find(obj, field):
 def cmd_start(a):
     with store() as data:
         key = ensure(data, resolve(a.ref, a.repo))
-        if a.project:
-            data["tasks"][key]["project"] = a.project
         task = data["tasks"][key]
     name = "t-" + re.sub(r"[^a-z0-9_-]", "-", (label(key, task) or key).lower())[:30]  # Herdr: lowercase, starts with a letter, ≤32
     if a.workspace:  # a new workspace named after the ticket, with a "research" tab
@@ -335,9 +317,8 @@ def cmd_enroll(a):
     try:
         ref = input("Ticket (42, owner/repo#42, PROJ-123, URL; blank for none): ").strip()
         title = None if ref else input("Title: ").strip()
-        project = input("Project (blank to skip): ").strip()
         stage = cur["history"][-1]["status"] if cur else "research"
-        key = apply(pane, stage, ref, title, project, cwd=info.get("cwd"), session=session)
+        key = apply(pane, stage, ref, title, cwd=info.get("cwd"), session=session)
     except (EOFError, KeyboardInterrupt):
         return
     except SystemExit as e:
@@ -357,13 +338,9 @@ def cmd_hook(a):
     except ValueError:
         inp = {}
     if a.event == "session":
-        top = sh("git", "rev-parse", "--show-toplevel", check=False, cwd=inp.get("cwd")).strip() or inp.get("cwd") or ""
-        repo = os.path.basename(top).lower()  # hide projects that are really repo names, so they don't get reused
-        projects = sorted({t["project"] for t in load()["tasks"].values() if t.get("project") and t["project"].lower() != repo})
-        tickets = [f"{label(k, t)} {t['title'].strip()}" + (f" [{t['project']}]" if t.get("project") else "")
+        tickets = [f"{label(k, t)} {t['title'].strip()}"
                    for k, t in load()["tasks"].items() if label(k, t) and t["history"][-1]["status"] != "merged"]
-        return print(INSTRUCTIONS + (f"\n- Existing projects: {', '.join(projects)}." if projects else "")
-                     + ("\n- Open tickets on the board. If this work belongs to one, link to it with `set <stage> <ref>`; several tabs can share "
+        return print(INSTRUCTIONS + ("\n- Open tickets on the board. If this work belongs to one, link to it with `set <stage> <ref>`; several tabs can share "
                         "a ticket and its stage:\n" + "\n".join(f"  {x}" for x in tickets) if tickets else ""))
     sid, prompt = inp.get("session_id"), " ".join(inp.get("prompt", "").split())
     if not prompt or re.fullmatch(r"/\S+", prompt):
@@ -384,8 +361,13 @@ def label(key, t):
 
 
 def ago(iso):
-    s = int((datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds())
-    return next(f"{s // d}{u}" for d, u in ((86400, "d"), (3600, "h"), (60, "m"), (1, "s")) if s >= d or u == "s")
+    """Elapsed time like 13m or 2h; a local date like "Oct 7 (Wed)" once it's 8h or more."""
+    at = datetime.fromisoformat(iso)
+    s = int((datetime.now(timezone.utc) - at).total_seconds())
+    if s >= 8 * 3600:
+        local = at.astimezone()
+        return f"{local:%b} {local.day} ({local:%a})"
+    return next(f"{s // d}{u}" for d, u in ((3600, "h"), (60, "m"), (1, "s")) if s >= d or u == "s")
 
 
 def live_panes():
@@ -400,6 +382,8 @@ START = "▶ start"
 DIM, BOLD = "\033[2m{}\033[0m", "\033[1;4m{}\033[0m"
 PR_STYLES = {"CI failing": "\033[1;91m{}\033[0m", "changes requested": "\033[1;91m{}\033[0m", "PR closed": "\033[1;91m{}\033[0m",
              "approved": "\033[92m{}\033[0m", "CI passing": "\033[92m{}\033[0m", "CI running": "\033[93m{}\033[0m"}
+AGENT_ICONS = {"working": "◐", "blocked": "◉", "done": "✓", "idle": "○"}  # single-width, so line widths stay exact
+PR_STYLES.update({"◐": "\033[1;93m{}\033[0m", "◉": "\033[1;91m{}\033[0m", "✓": "\033[1;92m{}\033[0m", "○": "\033[2m{}\033[0m"})
 
 
 def last_pane(t):
@@ -428,10 +412,10 @@ def render(selected=None):
         cols = os.get_terminal_size(sys.stdout.fileno()).columns
     except OSError:
         cols = shutil.get_terminal_size().columns
-    x0 = max([len(label(k, t) or "") + 8 for k, t in tasks.items()] + [len(NO_PROJECT) + 4, 14])
+    x0 = max([len(label(k, t) or "") + 8 for k, t in tasks.items()] + [14])
 
     def rail(name="", mark=False):
-        """A spacer line: optional project name or selection mark, then a dotted rail under every stage."""
+        """A spacer line: optional heading or selection mark, then a dotted rail under every stage."""
         rest = (" " * x0 + ("┆" + " " * (GAP - 1)) * len(STATUSES)).rstrip()
         if mark:
             return "\033[1m› \033[0m" + DIM.format(rest[2:])
@@ -445,19 +429,18 @@ def render(selected=None):
     for i, s in enumerate(STATUSES):
         x = x0 + i * GAP - len(s) // 2
         header[x:x + len(s)] = s
-    out, rows = ["\033[1mTask board\033[0m", "", "".join(header).rstrip()], {}
-    projects = {}
-    for key, t in sorted(tasks.items(), key=lambda kt: kt[1]["history"][-1]["at"], reverse=True):
+    out, rows = ["".join(header).rstrip()], {}
+    sections = {}  # active tasks: furthest stage first, then most recent; Done: newest first
+    for key, t in sorted(tasks.items(), key=lambda kt: (STATUSES.index(kt[1]["history"][-1]["status"]), kt[1]["history"][-1]["at"]), reverse=True):
         cur = t["history"][-1]
-        if cur["status"] == "merged":
-            if (datetime.now(timezone.utc) - datetime.fromisoformat(cur["at"])).days < DONE_DAYS:
-                projects.setdefault(DONE_SECTION, []).append((key, t))
-        else:
-            projects.setdefault(label(key, t) and t.get("project") or NO_PROJECT, []).append((key, t))
-    for project in sorted(projects, key=lambda p: (p == DONE_SECTION, p == NO_PROJECT)):  # keeps recency order otherwise
-        done = project == DONE_SECTION  # a plain list under a divider: no stage rails, no tab lines
-        out += ["", DONE.format(f"✓ {DONE_SECTION} ") + DIM.format("─" * max(0, cols - len(DONE_SECTION) - 4)), ""] if done else [rail(), rail(project)]
-        for key, t in projects[project]:
+        if cur["status"] != "merged":
+            sections.setdefault("", []).append((key, t))
+        elif (datetime.now(timezone.utc) - datetime.fromisoformat(cur["at"])).days < DONE_DAYS:
+            sections.setdefault(DONE_SECTION, []).append((key, t))
+    for section in sorted(sections, key=lambda p: p == DONE_SECTION):
+        done = section == DONE_SECTION  # a plain list under a divider: no stage rails, no tab lines
+        out += ["", DONE.format(f"✓ {DONE_SECTION} ") + DIM.format("─" * max(0, cols - len(DONE_SECTION) - 4)), ""] if done else []
+        for key, t in sections[section]:
             cur = t["history"][-1]
             mark = "\033[1m› \033[0m" if key == selected else "  "
             n, row = STATUSES.index(cur["status"]), mark + f"  {label(key, t) or ''}".ljust(x0 - 2)
@@ -477,8 +460,8 @@ def render(selected=None):
             ps = t.get("pr_status", {}) if pr and cur["status"] != "merged" else {}
             prs = [p for p in [ps.get("review"), ps.get("ci") and f"CI {ps['ci']}", ps.get("state") == "closed" and "PR closed"] if p]
             start = START if label(key, t) and cur["status"] == "created" and not pane else None
-            rest = [p for p in [f"{cur['status']} {ago(cur['at'])}", pr, *prs, cur.get("note"),
-                                f"agent {agent}" if agent else None if pane else start or "no tab"] if p]
+            rest = [p for p in [ago(cur['at']), pr, *prs, cur.get("note"),
+                                AGENT_ICONS.get(agent) if pane else start or "no tab"] if p]
             fit = room - x - 2 - sum(len(p) + 3 for p in rest)  # shorten the title so the PR link and status stay visible
             title = title.strip() if len(title.strip()) <= fit else title.strip()[:max(fit - 1, 10)] + "…"
             for piece in [title] + rest:
@@ -504,10 +487,11 @@ def render(selected=None):
             if label(key, t) and not done:
                 for p in tabs:
                     sel, tab = f"{key} {p}", live[p]
-                    text = " · ".join(x for x in [session_title(tab) or "untitled tab", f"agent {tab.get('agent_status')}" if tab.get("agent_status") else None] if x)
+                    icon = AGENT_ICONS.get(tab.get("agent_status"), " ")
+                    text = (session_title(tab) or "untitled tab")[:max(0, cols - x0 - GAP * (len(STATUSES) - 1) - 7)]
                     rows[len(out)] = (sel, tab, None, None, None, None, None)
-                    out.append(rail(mark=sel == selected) + DIM.format(("  ↳ " + text)[:max(0, cols - x0 - GAP * (len(STATUSES) - 1) - 2)]))
-    return out + ([] if DONE_SECTION in projects else [rail()]), rows
+                    out.append(rail(mark=sel == selected) + DIM.format("  ↳ ") + PR_STYLES.get(icon, "{}").format(icon) + DIM.format(" " + text))
+    return out + ([] if DONE_SECTION in sections else [rail()]), rows
 
 
 def jump(pane, later=False):
@@ -532,7 +516,7 @@ def cmd_board(a):
     tty.setcbreak(fd)
     sys.stdout.write("\033[?1049h\033[?25l\033[?1000h\033[?1006h")  # alt screen, no cursor, SGR mouse clicks
     selected, syncing, synced, offset = None, None, 0, 0
-    HEAD = 3  # title, blank line and stage names stay pinned while the rest scrolls
+    HEAD = 1  # stage names stay pinned while the rest scrolls
     try:
         while True:
             if (syncing is None or syncing.poll() is not None) and time.time() - synced > SYNC_EVERY:
@@ -547,7 +531,7 @@ def cmd_board(a):
             offset = max(0, min(offset, len(lines) - HEAD - room))
             body = lines[HEAD + offset:HEAD + offset + room]
             sys.stdout.write("\033[H\033[2J" + "\n".join(lines[:HEAD] + body + [""] * (room - len(body) + 1))
-                             + "\n\033[90m↑↓/jk select · enter or click jump · click ID/PR open · s sync Jira · "
+                             + "\n\033[90m◐ working ◉ needs you ✓ done ○ idle   ↑↓/jk select · enter or click jump · click ID/PR open · s sync Jira · "
                              + ("q/esc close" if a.popup else "q quit") + "\033[0m")
             sys.stdout.flush()
             if not select.select([sys.stdin], [], [], 2)[0]:
@@ -612,7 +596,6 @@ s = cmd("set", cmd_set, "move a task to a stage (default task: the one linked to
 s.add_argument("status", choices=STATUSES)
 s.add_argument("ref", nargs="?", help=REF)
 s.add_argument("--title")
-s.add_argument("--project")
 s.add_argument("--pr", help="PR URL")
 s.add_argument("--note", help="shown on the board, e.g. 'CI failing'")
 s.add_argument("--detached", action="store_true", help="don't link the calling pane to the task")
@@ -620,7 +603,6 @@ s.add_argument("--force", action="store_true", help="allow moving a task back to
 for name, fn, help in [("add", cmd_add, "track a ticket without starting an agent"), ("start", cmd_start, "split a pane and start an agent on a ticket")]:
     s = cmd(name, fn, help)
     s.add_argument("ref", help=REF)
-    s.add_argument("--project")
 sub.choices["start"].add_argument("--kind", default="claude")
 sub.choices["start"].add_argument("--direction", choices=["right", "down"], default="right")
 sub.choices["start"].add_argument("--workspace", action="store_true", help="open a new workspace in TASKS_START_DIR instead of splitting this pane")
