@@ -13,12 +13,21 @@ from `created` to `merged`, with the tabs working on each one.
 
 ## Install
 
-Needs Herdr 0.7+, Python 3.9+, [`gh`](https://cli.github.com), and [`jira`](https://github.com/ankitpokhrel/jira-cli) for Jira.
+Needs Herdr 0.7+ and Python 3.9+. [`gh`](https://cli.github.com) for PR status and GitHub issues, [`jira`](https://github.com/ankitpokhrel/jira-cli) for Jira issues.
 
 ```bash
 herdr plugin install simpikkle/herdr-dashboard
-herdr plugin action invoke simpikkle.dashboard.setup   # puts `dashboard` on PATH, adds the Claude Code hooks
+herdr plugin action invoke simpikkle.dashboard.setup   # asks a few questions, puts `dashboard` on PATH, adds the Claude Code hooks
 ```
+
+## Connect
+
+Setup asks which tracker to sync issues from (GitHub, Jira or none), which issues, and the folder where
+`▶ start` opens new work. Run it again to change your answers.
+
+- **GitHub**: `brew install gh && gh auth login`. Also needed to show PR status.
+- **Jira**: `brew install jira-cli && jira init` (Cloud, your Jira URL, your email).
+  It needs an [API token](https://id.atlassian.com/manage-profile/security/api-tokens) in `JIRA_API_TOKEN`.
 
 ## Use
 

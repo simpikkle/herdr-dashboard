@@ -7,7 +7,7 @@ Open it as a popup (`simpikkle.dashboard.board-popup`) or in its own tab (`simpi
 - `↑`/`↓` or `j`/`k` select, `Enter` or a click jumps to the task's tab
 - click a ticket ID to open the ticket, `PR #…` (or `o`) to open the PR
 - click `▶ start` on a ticket that hasn't started to run `dashboard start --workspace` for it
-- `s` syncs Jira and PR status (also runs every 5 minutes while the board is open)
+- `s` syncs issues and PR status (also runs every 5 minutes while the board is open)
 - `q` closes it (`Esc` too, in the popup)
 
 Tasks are ordered by stage, furthest along first. Tabs working on a ticket are listed under it:
@@ -47,7 +47,8 @@ dashboard set merged PROJ-123 --detached # update without linking this pane
 dashboard start PROJ-123 --workspace     # new workspace with a "research" tab and a Claude prompt
 dashboard start 42                       # split this pane and start an agent on it
 dashboard add PROJ-123                   # track without starting
-dashboard sync                           # add open Jira issues, refresh PR status, mark merged PRs
+dashboard sync [--query Q]               # add issues from your tracker, refresh PR status, mark merged PRs
+dashboard setup                          # change tracker, query or start folder
 dashboard list [--json]
 dashboard rename task-7 "Fix login"
 dashboard rm task-7
@@ -57,10 +58,12 @@ dashboard rm task-7
 
 ## Settings
 
-Environment variables, or `KEY=value` lines in `~/.config/herdr-dashboard/config`:
+`dashboard setup` writes these to `~/.config/herdr-dashboard/config`; environment variables override them:
 
 | Variable | Default |
 | --- | --- |
 | `DASHBOARD_START_DIR` — where `start --workspace` opens and Claude looks for the repo | `~` |
-| `DASHBOARD_JIRA_JQL` — issues `dashboard sync` adds | `assignee = currentUser() AND statusCategory != Done AND issuetype != Epic` |
+| `DASHBOARD_ISSUES` — tracker `dashboard sync` adds issues from: `github`, `jira` or `none` | `none` |
+| `DASHBOARD_GITHUB_QUERY` — GitHub issue search | `assignee:@me state:open` |
+| `DASHBOARD_JIRA_JQL` — Jira issues | `assignee = currentUser() AND statusCategory != Done AND issuetype != Epic` |
 | `DASHBOARD_FILE` — state file | `~/.local/state/herdr-dashboard/tasks.json` |

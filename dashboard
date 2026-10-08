@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Track tasks (GitHub issues, Jira tickets, untitled work) through created → research → code → testing → pr → merged."""
-import argparse, fcntl, json, os, re, select, shutil, subprocess, sys, termios, time, tty
+import argparse, fcntl, json, os, re, select, shlex, shutil, subprocess, sys, termios, time, tty
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -19,6 +19,8 @@ except FileNotFoundError:
     pass
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
 DONE_SECTION, DONE_DAYS = "Done", 14  # merged tasks are listed here, newest first, for this many days
+ISSUES = os.environ.get("DASHBOARD_ISSUES", "none")  # tracker `sync` pulls issues from: github, jira or none
+GH_QUERY = os.environ.get("DASHBOARD_GITHUB_QUERY", "assignee:@me state:open")
 JQL = os.environ.get("DASHBOARD_JIRA_JQL", "assignee = currentUser() AND statusCategory != Done AND issuetype != Epic")
 START_DIR = os.environ.get("DASHBOARD_START_DIR", "~")  # where `start --workspace` opens, and repos are looked for
 SYNC_EVERY = 300  # seconds between Jira syncs while the board is open
@@ -34,7 +36,12 @@ INSTRUCTIONS = f"""This Claude session runs in a Herdr pane that is tracked on a
 
 
 def sh(*cmd, check=True, cwd=None):
-    r = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=cwd)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=cwd)
+    except FileNotFoundError:
+        if check:
+            sys.exit(f"{cmd[0]} is not installed")
+        return ""
     if check and r.returncode:
         sys.exit(f"{' '.join(cmd[:3])}…: {r.stderr.strip() or r.stdout.strip()}")
     return r.stdout
@@ -178,7 +185,10 @@ def cmd_rm(a):
 
 
 def cmd_sync(a):
-    sync_jira(a.jql)
+    if ISSUES == "jira":
+        sync_jira(a.query or JQL)
+    elif ISSUES == "github":
+        sync_github(a.query or GH_QUERY)
     sync_prs()
 
 
@@ -187,6 +197,8 @@ FAILED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STAR
 
 def sync_prs():
     """Refresh CI and review state of open PRs; move tasks whose PR was merged to merged."""
+    if not shutil.which("gh"):
+        return print("gh is not installed, skipping PRs")
     checked = merged = 0
     for key, t in load()["tasks"].items():
         if not t.get("pr") or t["history"][-1]["status"] == "merged":
@@ -211,6 +223,27 @@ def sync_prs():
                 transition(data, key, "merged")
                 merged += 1
     print(f"{checked} PRs checked, {merged} merged")
+
+
+def sync_github(query):
+    """Add GitHub issues matching a search query that aren't tracked yet, and refresh titles."""
+    if not shutil.which("gh"):
+        return print("gh is not installed, skipping GitHub issues")
+    r = subprocess.run(["gh", "search", "issues", *shlex.split(query), "--json", "repository,number,title,url", "--limit", "100"],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if r.returncode:
+        return print(f"gh search issues: {r.stderr.strip()}", file=sys.stderr)
+    issues, added = json.loads(r.stdout), []
+    with store() as data:
+        for i in issues:
+            repo = i["repository"]["nameWithOwner"]
+            key = f"{repo}#{i['number']}"
+            if key not in data["tasks"]:
+                data["tasks"][key] = dict(repo=repo, number=i["number"], title=i["title"], url=i["url"], history=[])
+                transition(data, key, "created")
+                added.append(key)
+            data["tasks"][key]["title"] = i["title"]
+    print(f"{len(issues)} issues, added {len(added)}" + (f": {' '.join(added)}" if added else ""))
 
 
 def sync_jira(jql):
@@ -243,8 +276,45 @@ def sync_jira(jql):
     print(f"{len(issues)} issues, added {len(added)}" + (f": {' '.join(added)}" if added else ""))
 
 
+def ask(question, default, choices=None):
+    while True:
+        answer = input(f"{question} [{default}]: ").strip() or default
+        if not choices or answer in choices:
+            return answer
+        print(f"choose one of: {', '.join(choices)}")
+
+
+def save_config(values):
+    """Set KEY=value lines in the config file, keeping the others."""
+    try:
+        with open(CONFIG) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+    for k, v in values.items():
+        lines = [l for l in lines if l.partition("=")[0].strip() != k] + [f"{k}={v}"]
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def cmd_setup(a):
-    """Put `dashboard` on PATH and add the Claude Code hooks. Safe to run again."""
+    """Ask which tracker to sync and where to start work, put `dashboard` on PATH, add the Claude Code hooks.
+    Safe to run again: earlier answers are the defaults."""
+    if sys.stdin.isatty():
+        issues = ask("Sync issues from (github, jira, none)", ISSUES, ["github", "jira", "none"])
+        values = {"DASHBOARD_ISSUES": issues}
+        if issues == "github":
+            values["DASHBOARD_GITHUB_QUERY"] = ask("GitHub search query", GH_QUERY)
+        elif issues == "jira":
+            values["DASHBOARD_JIRA_JQL"] = ask("Jira JQL", JQL)
+        values["DASHBOARD_START_DIR"] = ask("Folder where ▶ start opens and Claude looks for repos", START_DIR)
+        save_config(values)
+        print(f"saved to {CONFIG}")
+        tool = {"github": "gh", "jira": "jira"}.get(issues)
+        if tool and not shutil.which(tool):
+            print(f"{tool} is not installed yet: see the README")
+        print()
     link = os.path.expanduser("~/.local/bin/dashboard")
     os.makedirs(os.path.dirname(link), exist_ok=True)
     if os.path.islink(link) or not os.path.exists(link):
@@ -286,9 +356,7 @@ Optional: bind a key to the board popup in Herdr's config.toml:
 key = "prefix+d"
 type = "plugin_action"
 command = "simpikkle.dashboard.board-popup"
-description = "dashboard"
-
-Settings go in {CONFIG}.""")
+description = "dashboard\"""")
     if a.wait:
         input("\nEnter to close")
 
@@ -560,9 +628,22 @@ def jump(pane, later=False):
     return True
 
 
+def notices():
+    """Shown under the board: missing tools for PR status or the chosen tracker, or a tip to choose one."""
+    warn, out = "\033[1;93m⚠ {}\033[0m", []
+    if not shutil.which("gh"):
+        out.append(warn.format("gh is not installed, so PR status" + (" and GitHub issues" if ISSUES == "github" else "")
+                               + " can't be checked: brew install gh && gh auth login"))
+    if ISSUES == "jira" and not shutil.which("jira"):
+        out.append(warn.format("jira is not installed, so Jira issues can't be synced: brew install jira-cli && jira init"))
+    if ISSUES == "none":
+        out.append(DIM.format("Tip: run `dashboard setup` to sync your GitHub or Jira issues"))
+    return out
+
+
 def cmd_board(a):
     if a.once or not sys.stdin.isatty():
-        return print("\n".join(render()[0]))
+        return print("\n".join(render()[0] + [""] + notices()))
     fd, old = sys.stdin.fileno(), termios.tcgetattr(sys.stdin)
     tty.setcbreak(fd)
     sys.stdout.write("\033[?1049h\033[?25l\033[?1000h\033[?1006h")  # alt screen, no cursor, SGR mouse clicks
@@ -575,14 +656,15 @@ def cmd_board(a):
                                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL), time.time()
             lines, rows = render(selected)
             keys = [r[0] for r in rows.values()]
-            room = max(1, os.get_terminal_size(fd).lines - HEAD - 2)
+            notes = notices()
+            room = max(1, os.get_terminal_size(fd).lines - HEAD - 2 - len(notes))
             sel_line = next((i for i, r in rows.items() if r[0] == selected), None)
             if sel_line is not None:  # keep the selection on screen
                 offset = min(max(offset, sel_line - HEAD - room + 1), sel_line - HEAD)
             offset = max(0, min(offset, len(lines) - HEAD - room))
             body = lines[HEAD + offset:HEAD + offset + room]
             sys.stdout.write("\033[H\033[2J" + "\n".join(lines[:HEAD] + body + [""] * (room - len(body) + 1))
-                             + "\n\033[90m◐ working ◉ needs you ✓ done ○ idle   ↑↓/jk select · enter or click jump · click ID/PR open · s sync Jira · "
+                             + "".join("\n" + n for n in notes) + "\n\033[90m◐ working ◉ needs you ✓ done ○ idle   ↑↓/jk select · enter or click jump · click ID/PR open · s sync · "
                              + ("q/esc close" if a.popup else "q quit") + "\033[0m")
             sys.stdout.flush()
             if not select.select([sys.stdin], [], [], 2)[0]:
@@ -657,7 +739,7 @@ for name, fn, help in [("add", cmd_add, "track a ticket without starting an agen
 sub.choices["start"].add_argument("--kind", default="claude")
 sub.choices["start"].add_argument("--direction", choices=["right", "down"], default="right")
 sub.choices["start"].add_argument("--workspace", action="store_true", help="open a new workspace in DASHBOARD_START_DIR instead of splitting this pane")
-cmd("sync", cmd_sync, "add Jira issues matching a JQL query (default: DASHBOARD_JIRA_JQL or your open non-epic issues) and refresh PR status").add_argument("--jql", default=JQL)
+cmd("sync", cmd_sync, "add issues from the tracker chosen in setup and refresh PR status").add_argument("--query", help="override the saved GitHub query or Jira JQL")
 cmd("setup", cmd_setup, "put dashboard on PATH and add the Claude Code hooks").add_argument("--wait", action="store_true")
 cmd("rm", cmd_rm, "stop tracking a task").add_argument("ref", help=REF)
 s = cmd("rename", cmd_rename, "change a task's title")
