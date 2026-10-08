@@ -2,7 +2,7 @@ id = "simpikkle.tasks"
 name = "Task Board"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
-description = "Track GitHub issues through created → research → code → testing → released"
+description = "Track GitHub issues, Jira tickets and untitled work through created → research → code → testing → pr → merged"
 platforms = ["linux", "macos"]
 
 [[panes]]
@@ -11,8 +11,36 @@ title = "Task board"
 placement = "tab"
 command = ["python3", "tasks", "board"]
 
+[[panes]]
+id = "board-popup"
+title = "Task board"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["python3", "tasks", "board", "--popup"]
+
+[[actions]]
+id = "board-popup"
+title = "Show task board (popup)"
+contexts = ["workspace"]
+command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint board-popup"]
+
 [[actions]]
 id = "open-board"
 title = "Open task board"
 contexts = ["workspace"]
 command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint board --focus"]
+
+[[panes]]
+id = "enroll"
+title = "Enroll pane"
+placement = "popup"
+width = "70%"
+height = 12
+command = ["python3", "tasks", "enroll"]
+
+[[actions]]
+id = "enroll"
+title = "Enroll pane in task board"
+contexts = ["workspace"]
+command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint enroll --env TASKS_PANE=\"$HERDR_PANE_ID\""]

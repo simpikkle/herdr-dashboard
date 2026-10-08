@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
-"""Track GitHub issues through created → research → code → testing → released."""
-import argparse, fcntl, json, os, re, select, shutil, subprocess, sys, termios, time, tty
+"""Track tasks (GitHub issues, Jira tickets, untitled work) through created → research → code → testing → pr → merged."""
+import argparse, fcntl, json, os, re, select, shutil, subprocess, sys, termios, tty
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-STATUSES = ["created", "research", "code", "testing", "released"]
-COLORS = {"created": 90, "research": 34, "code": 33, "testing": 35, "released": 32}
+STATUSES = ["created", "research", "code", "testing", "pr", "merged"]
+DONE = "\033[1;92m{}\033[0m"  # bold bright green for reached stages
 STORE = os.path.expanduser(os.environ.get("TASKS_FILE", "~/.local/state/herdr-tasks/tasks.json"))
 SELF = os.path.realpath(__file__)
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
+NO_PROJECT = "No project"
+
+INSTRUCTIONS = f"""This Claude session runs in a Herdr pane that is tracked on a task board. Keep the board current with:
+  {SELF} set <stage> [ref] [--title T] [--project P] [--pr URL] [--note N]
+- ref: GitHub issue (42, owner/repo#42, issue URL) or Jira key (PROJ-123). Omit it to update this pane's task.
+- As soon as you know the ticket for the work, run `set <stage> <ref>`; that links this pane's task to it. Work with no ticket: omit ref and give a short --title.
+- Pass --project with the feature or initiative the work belongs to, in a few words (e.g. "Search redesign", "Billing v2 migration"). Work it out from the ticket, the branch name and recent commits. Never use the repo or directory name. Reuse a name from the existing projects below only when the work really belongs to that initiative, not because it matches the repo.
+- Stages: research (investigating), code (changing code), testing (verifying), pr (once you open a PR; pass --pr <url>). Never set merged.
+- Pick the stage from the state of the work, not from how the user phrases the request: check the branch, `git status`/`git diff` and whether a PR exists (`gh pr view`). Uncommitted or branch changes for the task mean at least `code`; an open PR means `pr`.
+- Look at the stage again once your first pass over the code is done, and run `set` whenever it changes. Skip all of this for quick questions that aren't work on a task."""
 
 
-def sh(*cmd, check=True):
-    r = subprocess.run(cmd, capture_output=True, text=True)
+def sh(*cmd, check=True, cwd=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=cwd)
     if check and r.returncode:
         sys.exit(f"{' '.join(cmd[:3])}…: {r.stderr.strip() or r.stdout.strip()}")
     return r.stdout
@@ -25,9 +35,16 @@ def now():
 def load():
     try:
         with open(STORE) as f:
-            return json.load(f)
+            data = json.load(f)
     except FileNotFoundError:
-        return {"tasks": {}}
+        data = {}
+    data.setdefault("tasks", {})
+    data.setdefault("panes", {})
+    for t in data["tasks"].values():
+        for e in t["history"]:
+            if e["status"] == "released":
+                e["status"] = "merged"
+    return data
 
 
 @contextmanager
@@ -43,62 +60,211 @@ def store():
         os.replace(tmp, STORE)
 
 
-def resolve(ref, repo=None):
-    m = re.fullmatch(r"(?:([\w.-]+/[\w.-]+))?#?(\d+)", ref)
+def resolve(ref, repo=None, cwd=None):
+    """Turn a ref into a task key: owner/repo#42, PROJ-123 or task-7."""
+    if re.fullmatch(r"task-\d+", ref):
+        return ref
+    m = re.fullmatch(r"(?:https?://\S+/browse/)?([A-Z][A-Z0-9]+-\d+)", ref)
+    if m:
+        return m[1]
+    m = (re.fullmatch(r"https://github\.com/([\w.-]+/[\w.-]+)/issues/(\d+)", ref)
+         or re.fullmatch(r"(?:([\w.-]+/[\w.-]+))?#?(\d+)", ref))
     if not m:
-        sys.exit(f"bad issue ref {ref!r}: use 42, #42 or owner/repo#42")
-    repo = m[1] or repo or sh("gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").strip()
-    return repo, int(m[2])
+        sys.exit(f"bad ref {ref!r}: use 42, #42, owner/repo#42, an issue URL or a Jira key like PROJ-123")
+    repo = m[1] or repo or sh("gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner", cwd=cwd).strip()
+    return f"{repo}#{m[2]}"
 
 
-def transition(data, key, status, note=None):
-    pane = os.environ.get("HERDR_PANE_ID")
+def fetch(key):
+    if "#" in key:
+        repo, num = key.split("#")
+        info = json.loads(sh("gh", "issue", "view", num, "-R", repo, "--json", "title,url"))
+        return dict(repo=repo, number=int(num), **info)
+    raw = json.loads(sh("jira", "issue", "view", key, "--raw"))
+    return dict(title=raw["fields"]["summary"], url=raw["self"].split("/rest/")[0] + "/browse/" + key)
+
+
+def transition(data, key, status, pane=None, note=None):
     entry = {k: v for k, v in dict(status=status, at=now(), pane=pane, note=note).items() if v}
     data["tasks"][key]["history"].append(entry)
     if pane:
         sh(HERDR, "pane", "report-metadata", pane, "--source", "simpikkle.tasks",
-           "--custom-status", f"#{key.split('#')[1]} {status}", check=False)
+           "--custom-status", " ".join(filter(None, [label(key, data["tasks"][key]), status])), check=False)
 
 
-def ensure(data, repo, num):
-    key = f"{repo}#{num}"
+def ensure(data, key):
     if key not in data["tasks"]:
-        info = json.loads(sh("gh", "issue", "view", str(num), "-R", repo, "--json", "title,url"))
-        data["tasks"][key] = dict(repo=repo, number=num, **info, history=[])
+        if key.startswith("task-"):
+            sys.exit(f"no task {key}")
+        data["tasks"][key] = dict(fetch(key), history=[])
         transition(data, key, "created")
     return key
 
 
-def cmd_add(a):
+def new_local(data, title, pane=None, auto=False):
+    n = 1 + max((int(k[5:]) for k in data["tasks"] if k.startswith("task-")), default=0)
+    key = f"task-{n}"
+    data["tasks"][key] = dict(title=title, history=[], **({"auto": True} if auto else {}))
+    transition(data, key, "created", pane)
+    return key
+
+
+def bind(data, pane, key, session=None):
+    """Link a pane to a task. A local task the pane was on is folded into the ticket it turned out to be."""
+    old = data["panes"].get(pane, {})
+    prev = old.get("task")
+    if prev != key and prev in data["tasks"] and prev.startswith("task-") and not key.startswith("task-"):
+        p, t = data["tasks"].pop(prev), data["tasks"][key]
+        t["history"] = sorted(p["history"] + t["history"], key=lambda e: e["at"])
+        if p.get("project") and not t.get("project"):
+            t["project"] = p["project"]
+    data["panes"][pane] = dict(old, task=key, **({"session": session} if session else {}))
+
+
+def apply(pane, status, ref=None, title=None, project=None, pr=None, note=None, repo=None, cwd=None, session=None):
     with store() as data:
-        print(ensure(data, *resolve(a.issue, a.repo)))
+        if ref:
+            key = ensure(data, resolve(ref, repo, cwd))
+            if pane:
+                bind(data, pane, key, session)
+        else:
+            key = data["panes"].get(pane, {}).get("task") if pane else None
+            if key not in data["tasks"]:
+                if not title:
+                    sys.exit("no task linked to this pane: pass a ref or --title")
+                key = new_local(data, title)
+                if pane:
+                    bind(data, pane, key, session)
+        t = data["tasks"][key]
+        t.update({k: v for k, v in dict(title=title, project=project, pr=pr).items() if v})
+        if title:
+            t.pop("auto", None)
+        transition(data, key, status, pane, note)
+    return key
 
 
 def cmd_set(a):
-    with store() as data:
-        key = ensure(data, *resolve(a.issue, a.repo))
-        transition(data, key, a.status, a.note)
+    pane = None if a.detached else os.environ.get("HERDR_PANE_ID")
+    key = apply(pane, a.status, a.ref, a.title, a.project, a.pr, a.note, a.repo)
     print(f"{key} → {a.status}")
 
 
-def cmd_start(a):
-    repo, num = resolve(a.issue, a.repo)
+def cmd_add(a):
     with store() as data:
-        key = ensure(data, repo, num)
+        key = ensure(data, resolve(a.ref, a.repo))
+        if a.project:
+            data["tasks"][key]["project"] = a.project
+    print(key)
+
+
+def cmd_rm(a):
+    with store() as data:
+        key = resolve(a.ref, a.repo)
+        if not data["tasks"].pop(key, None):
+            sys.exit(f"no task {key}")
+        data["panes"] = {p: b for p, b in data["panes"].items() if b.get("task") != key}
+    print(f"removed {key}")
+
+
+def cmd_rename(a):
+    with store() as data:
+        key = resolve(a.ref, a.repo)
+        if key not in data["tasks"]:
+            sys.exit(f"no task {key}")
+        data["tasks"][key]["title"] = a.title
+        data["tasks"][key].pop("auto", None)
+    print(f"{key}: {a.title}")
+
+
+def cmd_list(a):
+    tasks = load()["tasks"]
+    if a.json:
+        return print(json.dumps(tasks, indent=2))
+    for key, t in tasks.items():
+        print("\t".join([key, t["history"][-1]["status"], t.get("project", ""), t.get("pr", ""), t["title"]]))
+
+
+def cmd_start(a):
+    with store() as data:
+        key = ensure(data, resolve(a.ref, a.repo))
+        if a.project:
+            data["tasks"][key]["project"] = a.project
         task = data["tasks"][key]
     split = json.loads(sh(HERDR, "pane", "split", "--current", "--direction", a.direction,
                           "--cwd", os.getcwd(), "--no-focus"))
-    pane, name = split["result"]["pane"]["pane_id"], f"issue-{num}"
-    sh(HERDR, "agent", "start", name, "--kind", a.kind, "--pane", pane)
+    pane, name = split["result"]["pane"]["pane_id"], key.replace("/", "-").replace("#", "-")
     with store() as data:
-        os.environ["HERDR_PANE_ID"] = pane
-        transition(data, key, "research")
+        bind(data, pane, key)
+        transition(data, key, "research", pane)
+    sh(HERDR, "agent", "start", name, "--kind", a.kind, "--pane", pane)
     sh(HERDR, "agent", "prompt", name,
-       f"Work on GitHub issue {task['url']} ({task['title']}). Read it with `gh issue view {num} -R {repo}`. "
-       f"Report your phase whenever it changes by running `{SELF} set {key} <status>`, where status is "
-       f"`research` while investigating, `code` once you start changing code, and `testing` while verifying. "
-       f"Never set `released`; I do that.")
+       f"Work on {task['url']} ({task['title']}). Report your phase whenever it changes by running "
+       f"`{SELF} set <stage> {key}`: `research` while investigating, `code` once you change code, `testing` "
+       f"while verifying, `pr` once you open a PR (add `--pr <url>`). Never set `merged`.")
     print(f"{key}: agent {name} started in {pane}")
+
+
+def cmd_enroll(a):
+    """Interactive: link a pane (default: the one the action was invoked on) to a task."""
+    pane = a.pane or os.environ.get("TASKS_PANE") or os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        sys.exit("no pane to enroll")
+    info = json.loads(sh(HERDR, "pane", "get", pane))["result"]["pane"]
+    session = (info.get("agent_session") or {}).get("value")
+    with store() as data:
+        cur = data["tasks"].get(data["panes"].get(pane, {}).get("task"))
+    print(f"Enroll pane {pane} ({info.get('terminal_title_stripped') or info.get('cwd')})")
+    if cur:
+        print(f"currently: {cur['title']}")
+    try:
+        ref = input("Ticket (42, owner/repo#42, PROJ-123, URL; blank for none): ").strip()
+        title = None if ref else input("Title: ").strip()
+        project = input("Project (blank to skip): ").strip()
+        stage = cur["history"][-1]["status"] if cur else "research"
+        key = apply(pane, stage, ref, title, project, cwd=info.get("cwd"), session=session)
+    except (EOFError, KeyboardInterrupt):
+        return
+    except SystemExit as e:
+        print(e)
+        input("Enter to close")
+        return
+    print(f"enrolled {key}")
+
+
+def cmd_hook(a):
+    """Claude Code hooks: `session` prints board instructions, `prompt` gives every untracked session a task."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        return
+    try:
+        inp = json.load(sys.stdin)
+    except ValueError:
+        inp = {}
+    if a.event == "session":
+        top = sh("git", "rev-parse", "--show-toplevel", check=False, cwd=inp.get("cwd")).strip() or inp.get("cwd") or ""
+        repo = os.path.basename(top).lower()  # hide projects that are really repo names, so they don't get reused
+        projects = sorted({t["project"] for t in load()["tasks"].values() if t.get("project") and t["project"].lower() != repo})
+        tickets = [f"{label(k, t)} {t['title'].strip()}" + (f" [{t['project']}]" if t.get("project") else "")
+                   for k, t in load()["tasks"].items() if label(k, t) and t["history"][-1]["status"] != "merged"]
+        return print(INSTRUCTIONS + (f"\n- Existing projects: {', '.join(projects)}." if projects else "")
+                     + ("\n- Open tickets on the board. If this work belongs to one, link to it with `set <stage> <ref>`; several tabs can share "
+                        "a ticket and its stage:\n" + "\n".join(f"  {x}" for x in tickets) if tickets else ""))
+    sid, prompt = inp.get("session_id"), " ".join(inp.get("prompt", "").split())
+    if not prompt or re.fullmatch(r"/\S+", prompt):
+        return
+    with store() as data:
+        b = data["panes"].get(pane)
+        if b and b.get("task") in data["tasks"] and b.get("session") in (None, sid):
+            b["session"] = sid
+        else:
+            data["panes"][pane] = dict(task=new_local(data, prompt[:60], pane, auto=True), session=sid)
+
+
+def label(key, t):
+    """The ticket ID as shown to people; None for tasks without a ticket."""
+    if t.get("number"):
+        return f"{t['repo'].split('/')[-1]}#{t['number']}"
+    return None if key.startswith("task-") else key
 
 
 def ago(iso):
@@ -106,88 +272,203 @@ def ago(iso):
     return next(f"{s // d}{u}" for d, u in ((86400, "d"), (3600, "h"), (60, "m"), (1, "s")) if s >= d or u == "s")
 
 
-def paint(status, text):
-    return f"\033[{COLORS[status]}m{text}\033[0m"
-
-
-def agent_states():
+def live_panes():
     try:
-        return {p["pane_id"]: p.get("agent_status") for p in json.loads(sh(HERDR, "pane", "list", check=False))["result"]["panes"]}
+        return {p["pane_id"]: p for p in json.loads(sh(HERDR, "pane", "list", check=False))["result"]["panes"]}
     except Exception:
         return {}
 
 
-LABEL, GAP = 14, 12  # x of the first stage column, distance between stage columns
+GAP = 10  # distance between stage columns
 DIM, BOLD = "\033[2m{}\033[0m", "\033[1;4m{}\033[0m"
 
 
-def rail(label=""):
-    """A spacer line: optional project label, then a dotted rail under every stage it doesn't overlap."""
-    rest = (" " * LABEL + ("┆" + " " * (GAP - 1)) * len(STATUSES)).rstrip()
-    return (BOLD.format(label) if label else "") + DIM.format(rest[len(label):])
+def last_pane(t):
+    return next((e["pane"] for e in reversed(t["history"]) if e.get("pane")), None)
 
 
-def render():
-    tasks, live = load()["tasks"].values(), agent_states()
+def prune(live):
+    """Drop tasks without a ticket whose pane has closed."""
+    data = load()
+    dead = [k for k, t in data["tasks"].items() if not label(k, t) and last_pane(t) and last_pane(t) not in live]
+    if live and dead:
+        with store() as data:
+            for k in dead:
+                data["tasks"].pop(k, None)
+            data["panes"] = {p: b for p, b in data["panes"].items() if b.get("task") in data["tasks"]}
+
+
+def render(selected=None):
+    """Board lines, plus {line index: (selection id, live pane, PR url, PR column span)} for task and tab rows."""
+    live = live_panes()
+    prune(live)
+    data = load()
+    tasks = data["tasks"]
     try:  # ask the tty: a stale COLUMNS env from pane spawn would win in shutil
         cols = os.get_terminal_size(sys.stdout.fileno()).columns
     except OSError:
         cols = shutil.get_terminal_size().columns
-    header = [" "] * (LABEL + GAP * len(STATUSES))
+    x0 = max([len(label(k, t) or "") + 8 for k, t in tasks.items()]
+             + [len(t.get("project") or NO_PROJECT) + 4 for t in tasks.values()] + [14])
+
+    def rail(name="", mark=False):
+        """A spacer line: optional project name or selection mark, then a dotted rail under every stage."""
+        rest = (" " * x0 + ("┆" + " " * (GAP - 1)) * len(STATUSES)).rstrip()
+        if mark:
+            return "\033[1m› \033[0m" + DIM.format(rest[2:])
+        return (BOLD.format(name) if name else "") + DIM.format(rest[len(name):])
+
+    def session_title(pane):
+        term = pane.get("terminal_title_stripped")
+        return term if term and term != "Claude Code" else None
+
+    header = [" "] * (x0 + GAP * len(STATUSES))
     for i, s in enumerate(STATUSES):
-        x = LABEL + i * GAP - len(s) // 2
+        x = x0 + i * GAP - len(s) // 2
         header[x:x + len(s)] = s
-    out = ["\033[1mTask board\033[0m", "", "".join(header).rstrip()]
+    out, rows = ["\033[1mTask board\033[0m", "", "".join(header).rstrip()], {}
     projects = {}
-    for t in sorted(tasks, key=lambda t: t["history"][-1]["at"], reverse=True):
-        projects.setdefault(t["repo"], []).append(t)
-    for repo, issues in projects.items():
-        out += [rail(), rail(repo.split("/")[-1])]
-        for t in sorted(issues, key=lambda t: t["number"]):
+    for key, t in sorted(tasks.items(), key=lambda kt: kt[1]["history"][-1]["at"], reverse=True):
+        projects.setdefault(t.get("project") or NO_PROJECT, []).append((key, t))
+    for project in sorted(projects, key=lambda p: p == NO_PROJECT):  # keeps recency order otherwise
+        out += [rail(), rail(project)]
+        for key, t in projects[project]:
             cur = t["history"][-1]
-            n, row = STATUSES.index(cur["status"]), f"    #{t['number']}".ljust(LABEL)
+            mark = "\033[1m› \033[0m" if key == selected else "  "
+            n, row = STATUSES.index(cur["status"]), mark + f"  {label(key, t) or ''}".ljust(x0 - 2)
             for i, s in enumerate(STATUSES):
                 if i:
-                    row += paint(s, "─" * (GAP - 1)) if i <= n else DIM.format("─" * (GAP - 1))
-                row += paint(s, "●") if i <= n else DIM.format("○")
-            agent = live.get(next((e["pane"] for e in reversed(t["history"]) if e.get("pane")), None))
-            info = f"{t['title']} · {cur['status']} {ago(cur['at'])}" + (f" · agent {agent}" if agent else "")
-            out += [rail(), row + DIM.format("  " + info[:max(0, cols - LABEL - GAP * 4 - 3)])]
-    return out + [rail()]
+                    row += DONE.format("━" * (GAP - 1)) if i <= n else DIM.format("─" * (GAP - 1))
+                row += DONE.format("●") if i <= n else DIM.format("○")
+            tabs = [p for p, b in data["panes"].items() if b.get("task") == key and p in live]  # tabs on this ticket
+            if last_pane(t) in live and last_pane(t) not in tabs:
+                tabs.append(last_pane(t))
+            pane = live.get(last_pane(t)) or (live[tabs[0]] if tabs else {})
+            agent = pane.get("agent_status") if not label(key, t) else None  # tickets list their tabs below instead
+            title = (t.get("auto") and session_title(pane)) or t["title"]
+            m = re.search(r"/pull/(\d+)", t.get("pr", ""))
+            pr = (f"PR #{m[1]}" if m else "PR") if t.get("pr") else None
+            x, room, info, span = x0 + GAP * (len(STATUSES) - 1) + 3, cols - 1, "", None
+            for piece in [title.strip(), f"{cur['status']} {ago(cur['at'])}", pr, cur.get("note"), f"agent {agent}" if agent else None if pane else "no tab"]:
+                if not piece:
+                    continue
+                text = (" · " if info else "  ") + piece
+                fits = text[:max(0, room - x)]
+                if piece is pr and len(fits) == len(text):
+                    span = (x + len(text) - len(pr), x + len(text))
+                    info += DIM.format(text[:-len(pr)]) + f"\033[36;4m{pr}\033[0m"
+                else:
+                    info += DIM.format(fits)
+                x += len(fits)
+            rows[len(out) + 1] = (key, pane, t.get("pr"), span)
+            out += [rail(), row + info]
+            if label(key, t):
+                for p in tabs:
+                    sel, tab = f"{key} {p}", live[p]
+                    text = " · ".join(x for x in [session_title(tab) or "untitled tab", f"agent {tab.get('agent_status')}" if tab.get("agent_status") else None] if x)
+                    rows[len(out)] = (sel, tab, None, None)
+                    out.append(rail(mark=sel == selected) + DIM.format(("  ↳ " + text)[:max(0, cols - x0 - GAP * (len(STATUSES) - 1) - 2)]))
+    return out + [rail()], rows
+
+
+def jump(pane, later=False):
+    """Focus a pane's workspace and tab. `later` runs it detached, after a popup board has closed."""
+    if not pane:
+        return False
+    cmds = [[HERDR, "workspace", "focus", pane["workspace_id"]], [HERDR, "tab", "focus", pane["tab_id"]]]
+    if later:
+        script = "sleep 0.2; " + "; ".join(" ".join(f"'{c}'" for c in cmd) for cmd in cmds)
+        subprocess.Popen(["sh", "-c", script], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        for cmd in cmds:
+            sh(*cmd, check=False)
+    return True
 
 
 def cmd_board(a):
     if a.once or not sys.stdin.isatty():
-        return print("\n".join(render()))
+        return print("\n".join(render()[0]))
     fd, old = sys.stdin.fileno(), termios.tcgetattr(sys.stdin)
     tty.setcbreak(fd)
-    sys.stdout.write("\033[?1049h\033[?25l")
+    sys.stdout.write("\033[?1049h\033[?25l\033[?1000h\033[?1006h")  # alt screen, no cursor, SGR mouse clicks
+    selected = None
     try:
         while True:
-            sys.stdout.write("\033[H\033[2J" + "\n".join(render()) + "\n\n\033[90mq to quit\033[0m")
+            lines, rows = render(selected)
+            keys = [r[0] for r in rows.values()]
+            sys.stdout.write("\033[H\033[2J" + "\n".join(lines) + "\n\n\033[90m↑↓/jk select · enter or click jump · o open PR · "
+                             + ("q/esc close" if a.popup else "q quit") + "\033[0m")
             sys.stdout.flush()
-            if select.select([sys.stdin], [], [], 2)[0] and sys.stdin.read(1) == "q":
+            if not select.select([sys.stdin], [], [], 2)[0]:
+                continue
+            buf = os.read(fd, 256).decode(errors="ignore")
+            by_key = {r[0]: r for r in rows.values()}
+            for click in re.finditer(r"\033\[<(\d+);(\d+);(\d+)M", buf):  # button;col;row, 1-based
+                b, col, line = int(click[1]), int(click[2]) - 1, int(click[3]) - 1
+                if b == 0 and line in rows:
+                    key, pane, pr, span = rows[line]
+                    selected = key
+                    if span and span[0] <= col < span[1]:
+                        sh("open", pr, check=False)
+                    elif jump(pane, a.popup) and a.popup:
+                        return
+            buf = re.sub(r"\033\[<[\d;]*[Mm]", "", buf)
+            if "q" in buf or (a.popup and buf == "\033"):
                 break
+            for k in re.findall(r"\033\[[AB]|[jk\r\no]", buf):
+                i = keys.index(selected) if selected in keys else -1
+                if k in ("\033[B", "j") and keys:
+                    selected = keys[min(i + 1, len(keys) - 1)]
+                elif k in ("\033[A", "k") and keys:
+                    selected = keys[max(i - 1, 0)]
+                elif k in "\r\n" and selected in by_key:
+                    if jump(by_key[selected][1], a.popup) and a.popup:
+                        return
+                elif k == "o" and selected in by_key and by_key[selected][2]:
+                    sh("open", by_key[selected][2], check=False)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.write("\033[?1000l\033[?1006l\033[?25h\033[?1049l")
 
 
+REF = "42, #42, owner/repo#42, issue URL, Jira key (PROJ-123) or task-7"
 p = argparse.ArgumentParser(description=__doc__)
 sub = p.add_subparsers(required=True)
-for name, fn, extra in [("add", cmd_add, []), ("set", cmd_set, ["status"]), ("start", cmd_start, [])]:
-    s = sub.add_parser(name)
-    s.add_argument("issue", help="42, #42 or owner/repo#42")
-    if extra:
-        s.add_argument("status", choices=STATUSES)
-        s.add_argument("--note")
-    s.add_argument("--repo", help="owner/repo (default: repo of the current directory)")
+
+
+def cmd(name, fn, help=None):
+    s = sub.add_parser(name, help=help)
+    s.add_argument("--repo", help="owner/repo for bare issue numbers (default: repo of the current directory)")
     s.set_defaults(fn=fn)
-start = sub.choices["start"]
-start.add_argument("--kind", default="claude")
-start.add_argument("--direction", choices=["right", "down"], default="right")
-b = sub.add_parser("board")
-b.add_argument("--once", action="store_true")
-b.set_defaults(fn=cmd_board)
+    return s
+
+
+s = cmd("set", cmd_set, "move a task to a stage (default task: the one linked to this pane)")
+s.add_argument("status", choices=STATUSES)
+s.add_argument("ref", nargs="?", help=REF)
+s.add_argument("--title")
+s.add_argument("--project")
+s.add_argument("--pr", help="PR URL")
+s.add_argument("--note", help="shown on the board, e.g. 'CI failing'")
+s.add_argument("--detached", action="store_true", help="don't link the calling pane to the task")
+for name, fn, help in [("add", cmd_add, "track a ticket without starting an agent"), ("start", cmd_start, "split a pane and start an agent on a ticket")]:
+    s = cmd(name, fn, help)
+    s.add_argument("ref", help=REF)
+    s.add_argument("--project")
+sub.choices["start"].add_argument("--kind", default="claude")
+sub.choices["start"].add_argument("--direction", choices=["right", "down"], default="right")
+cmd("rm", cmd_rm, "stop tracking a task").add_argument("ref", help=REF)
+s = cmd("rename", cmd_rename, "change a task's title")
+s.add_argument("ref", help=REF)
+s.add_argument("title")
+cmd("list", cmd_list, "print tasks (tab-separated, or --json)").add_argument("--json", action="store_true")
+cmd("enroll", cmd_enroll, "interactively link a pane to a task").add_argument("--pane")
+s = cmd("hook", cmd_hook, "Claude Code hook entry point")
+s.add_argument("event", choices=["session", "prompt"])
+s = sub.add_parser("board")
+s.add_argument("--once", action="store_true")
+s.add_argument("--popup", action="store_true", help="close on esc and after jumping")
+s.set_defaults(fn=cmd_board)
 a = p.parse_args()
 a.fn(a)
