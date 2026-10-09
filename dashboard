@@ -189,7 +189,47 @@ def cmd_sync(a):
         sync_jira(a.query or JQL)
     elif ISSUES == "github":
         sync_github(a.query or GH_QUERY)
+    sync_jira_done()
+    sync_github_done()
     sync_prs()
+
+
+def sync_github_done():
+    """Move tracked GitHub issues that were closed to merged, so they show under Done."""
+    issues = [(k, t) for k, t in load()["tasks"].items() if t.get("number") and t["history"][-1]["status"] != "merged"]
+    if not issues or not shutil.which("gh"):
+        return
+    closed = []
+    for key, t in issues:
+        r = subprocess.run(["gh", "issue", "view", str(t["number"]), "-R", t["repo"], "--json", "state", "-q", ".state"],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        if r.stdout.strip() == "CLOSED":
+            closed.append(key)
+    with store() as data:
+        for key in closed:
+            if key in data["tasks"] and data["tasks"][key]["history"][-1]["status"] != "merged":
+                transition(data, key, "merged", note="closed on GitHub")
+    if closed:
+        print(f"closed on GitHub: {' '.join(closed)}")
+
+
+def sync_jira_done():
+    """Move tracked Jira tickets that are done in Jira to merged, so they show under Done."""
+    keys = [k for k, t in load()["tasks"].items() if label(k, t) == k and t["history"][-1]["status"] != "merged"]
+    if not keys or not shutil.which("jira"):
+        return
+    r = subprocess.run(["jira", "issue", "list", "-q", f"key in ({','.join(keys)}) AND statusCategory = Done", "--raw"],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    try:
+        done = [i["key"] for i in json.loads(r.stdout)]
+    except ValueError:
+        done = []  # "No result found" or an error
+    with store() as data:
+        for key in done:
+            if key in data["tasks"] and data["tasks"][key]["history"][-1]["status"] != "merged":
+                transition(data, key, "merged", note="done in Jira")
+    if done:
+        print(f"done in Jira: {' '.join(done)}")
 
 
 FAILED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
