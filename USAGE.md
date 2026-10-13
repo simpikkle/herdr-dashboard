@@ -11,7 +11,8 @@ Open it as a popup (`simpikkle.dashboard.board-popup`) or in its own tab (`simpi
 - `q` closes it (`Esc` too, in the popup)
 
 Tasks are ordered by stage, furthest along first. Tabs working on a ticket are listed under it:
-◐ working, ◉ needs you, ✓ done, ○ idle. Tasks merged in the last 2 weeks are listed under "Done".
+◐ working, ◉ needs you, ✓ done, ○ idle; 🐞 marks bugs, 👥 tickets assigned to someone else or no one. "Done" lists tasks merged and tickets you closed in the last
+2 weeks, with each ticket's current status (yellow if it's still open in the tracker).
 
 Bind a key in Herdr's `config.toml`:
 
@@ -31,6 +32,7 @@ description = "dashboard"
 - `UserPromptSubmit` creates an untitled task for each new session's pane
 
 Claude links the task to its ticket once it knows it, and moves it forward up to `pr`.
+It can also keep a short progress note (✎ on the board), like "proposed a plan" or "blocked: need input".
 It never sets `merged`, and stages only move back with `--force`, which Claude must ask you about.
 
 ## CLI
@@ -40,6 +42,10 @@ Refs: `42`, `#42`, `owner/repo#42`, an issue URL, a Jira key or URL, or `task-7`
 ```bash
 dashboard set code PROJ-123              # move a task to a stage; links this pane to it
 dashboard set testing                    # update the task linked to this pane
+dashboard link PROJ-123                  # link this pane without changing the stage
+dashboard note "proposed a plan"         # short progress note on the board ("" clears it)
+dashboard block PROJ-123 "waiting for X" # move to Blocked / Postponed (Claude only does this when asked)
+dashboard unblock PROJ-123
 dashboard set pr --pr <url>              # record the PR
 dashboard set code --title "Fix login"   # task without a ticket
 dashboard set code PROJ-123 --force      # move back to an earlier stage
@@ -66,4 +72,5 @@ dashboard rm task-7
 | `DASHBOARD_ISSUES` — tracker `dashboard sync` adds issues from: `github`, `jira` or `none` | `none` |
 | `DASHBOARD_GITHUB_QUERY` — GitHub issue search | `assignee:@me state:open` |
 | `DASHBOARD_JIRA_JQL` — Jira issues | `assignee = currentUser() AND statusCategory != Done AND issuetype != Epic` |
+| `DASHBOARD_JIRA_DONE_JQL` — Jira issues listed under Done | `statusCategory = Done AND issuetype != Epic AND (assignee = currentUser() OR status changed by currentUser()) AND updated >= -14d` |
 | `DASHBOARD_FILE` — state file | `~/.local/state/herdr-dashboard/tasks.json` |

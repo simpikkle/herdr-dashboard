@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Track tasks (GitHub issues, Jira tickets, untitled work) through created → research → code → testing → pr → merged."""
+"""Track tasks (GitHub issues, Jira tickets, untitled work) through created → research → code → pr → testing → merged."""
 import argparse, fcntl, json, os, re, select, shlex, shutil, subprocess, sys, termios, time, tty
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-STATUSES = ["created", "research", "code", "testing", "pr", "merged"]
+STATUSES = ["created", "research", "code", "pr", "testing", "merged"]
 DONE = "\033[1;92m{}\033[0m"  # bold bright green for reached stages
 STORE = os.path.expanduser(os.environ.get("DASHBOARD_FILE", "~/.local/state/herdr-dashboard/tasks.json"))
 SELF = os.path.realpath(__file__)
@@ -18,21 +18,28 @@ try:  # KEY=value settings; real environment variables win
 except FileNotFoundError:
     pass
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
+BLOCKED_SECTION = "Blocked / Postponed"  # only the user moves tasks here and back
 DONE_SECTION, DONE_DAYS = "Done", 14  # merged tasks are listed here, newest first, for this many days
 ISSUES = os.environ.get("DASHBOARD_ISSUES", "none")  # tracker `sync` pulls issues from: github, jira or none
 GH_QUERY = os.environ.get("DASHBOARD_GITHUB_QUERY", "assignee:@me state:open")
+DONE_JQL = os.environ.get("DASHBOARD_JIRA_DONE_JQL", "statusCategory = Done AND issuetype != Epic AND "
+                          "(assignee = currentUser() OR status changed by currentUser()) AND updated >= -14d")
 JQL = os.environ.get("DASHBOARD_JIRA_JQL", "assignee = currentUser() AND statusCategory != Done AND issuetype != Epic")
 START_DIR = os.environ.get("DASHBOARD_START_DIR", "~")  # where `start --workspace` opens, and repos are looked for
 SYNC_EVERY = 300  # seconds between Jira syncs while the board is open
 
 INSTRUCTIONS = f"""This Claude session runs in a Herdr pane that is tracked on a task board. Keep the board current with:
   {SELF} set <stage> [ref] [--title T] [--pr URL] [--note N]
+  {SELF} link <ref>
 - ref: GitHub issue (42, owner/repo#42, issue URL) or Jira key (PROJ-123). Omit it to update this pane's task.
-- As soon as you know the ticket for the work, run `set <stage> <ref>`; that links this pane's task to it. Work with no ticket: omit ref and give a short --title.
-- Stages: research (investigating), code (changing code), testing (verifying), pr (once you open a PR; pass --pr <url>). Never set merged.
+- As soon as you know which ticket the conversation is about, link this pane to it: `link <ref>`, or `set <stage> <ref>` if you also know the stage. Do this even for questions about a ticket; that is how the board shows which tabs work on it. Work with no ticket: `set <stage> --title <short title>`.
+- Stages: research (investigating), code (changing code), pr (once you open a PR; pass --pr <url>), testing (once testing of the change starts, usually after the PR is open). Never set merged.
 - Stages only move forward. Moving a task back needs --force: never pass it on your own; ask the user first and use it only if they say yes. If `set` refuses, leave the stage as it is.
-- Pick the stage from the state of the work, not from how the user phrases the request: check the branch, `git status`/`git diff` and whether a PR exists (`gh pr view`). Uncommitted or branch changes for the task mean at least `code`; an open PR means `pr`.
-- Look at the stage again once your first pass over the code is done, and run `set` whenever it changes. Skip all of this for quick questions that aren't work on a task."""
+- Pick the stage from the state of the work, not from how the user phrases the request: check the branch, `git status`/`git diff` and whether a PR exists (`gh pr view`). Uncommitted or branch changes for the task mean at least `code`; an open PR means at least `pr`.
+- Look at the stage again once your first pass over the code is done, and run `set` whenever it changes.
+- Optionally keep a short progress note so the user can see where things are without opening this tab:
+  {SELF} note "<a few words>"   e.g. "proposed a plan", "ready to implement", "blocked: need input on auth". Update it when that changes.
+- Only when the user asks, move a task to the Blocked / Postponed section with `{SELF} block <ref> "<reason>"`, or back with `{SELF} unblock <ref>`. Never on your own."""
 
 
 def sh(*cmd, check=True, cwd=None):
@@ -97,10 +104,31 @@ def resolve(ref, repo=None, cwd=None):
 def fetch(key):
     if "#" in key:
         repo, num = key.split("#")
-        info = json.loads(sh("gh", "issue", "view", num, "-R", repo, "--json", "title,url"))
-        return dict(repo=repo, number=int(num), **info)
+        info = json.loads(sh("gh", "issue", "view", num, "-R", repo, "--json", "title,url,labels"))
+        return dict(repo=repo, number=int(num), title=info["title"], url=info["url"], bug=gh_bug(info))
     raw = json.loads(sh("jira", "issue", "view", key, "--raw"))
-    return dict(title=raw["fields"]["summary"], url=raw["self"].split("/rest/")[0] + "/browse/" + key)
+    return dict(title=raw["fields"]["summary"], url=raw["self"].split("/rest/")[0] + "/browse/" + key,
+                bug=jira_bug(raw["fields"]))
+
+
+def gh_bug(issue):
+    return any(l["name"].lower() == "bug" for l in issue.get("labels") or [])
+
+
+def jira_bug(fields):
+    return (fields.get("issueType") or fields.get("issuetype") or {}).get("name") == "Bug"
+
+
+def utc(stamp):
+    """Jira/GitHub timestamp → our UTC ISO format."""
+    stamp = re.sub(r"([+-]\d\d)(\d\d)$", r"\1:\2", stamp.replace("Z", "+00:00"))  # +0200 → +02:00 for Python 3.9
+    stamp = re.sub(r"\.\d+", "", stamp)
+    return datetime.fromisoformat(stamp).astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def add_closed(data, key, info, at, note):
+    """Track a ticket that was closed without being worked on here, straight under Done."""
+    data["tasks"][key] = dict(info, history=[dict(status="merged", at=at, note=note)])
 
 
 def transition(data, key, status, pane=None, note=None):
@@ -134,7 +162,7 @@ def bind(data, pane, key, session=None):
     prev = old.get("task")
     if prev != key and prev in data["tasks"] and prev.startswith("task-") and not key.startswith("task-"):
         p, t = data["tasks"].pop(prev), data["tasks"][key]
-        t["history"] = sorted(p["history"] + t["history"], key=lambda e: e["at"])
+        t["history"] = p["history"] + t["history"]  # the ticket's own entries stay last, so its stage is kept
     data["panes"][pane] = dict(old, task=key, **({"session": session} if session else {}))
 
 
@@ -153,13 +181,16 @@ def apply(pane, status, ref=None, title=None, pr=None, note=None, repo=None, cwd
                 if pane:
                     bind(data, pane, key, session)
         t = data["tasks"][key]
-        t.update({k: v for k, v in dict(title=title, pr=pr).items() if v})
+        t.update({k: v for k, v in dict(title=title, pr=pr, progress=note).items() if v})
         if title:
             t.pop("auto", None)
-        was = t["history"][-1]["status"]
-        if STATUSES.index(status) < STATUSES.index(was) and not force:
-            sys.exit(f"{key} is at {was}; moving it back to {status} needs --force")
-        transition(data, key, status, pane, note)
+        was, refused = t["history"][-1]["status"], None
+        if status and STATUSES.index(status) < STATUSES.index(was) and not force:
+            refused = f"{key} is at {was}; moving it back to {status} needs --force (the pane is linked)"
+        elif status:
+            transition(data, key, status, pane, note)
+    if refused:  # after the store is saved, so the link above is kept
+        sys.exit(refused)
     return key
 
 
@@ -167,6 +198,42 @@ def cmd_set(a):
     pane = None if a.detached else os.environ.get("HERDR_PANE_ID")
     key = apply(pane, a.status, a.ref, a.title, a.pr, a.note, a.repo, force=a.force)
     print(f"{key} → {a.status}")
+
+
+def cmd_link(a):
+    pane = os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        sys.exit("not in a Herdr pane")
+    key = apply(pane, None, a.ref, repo=a.repo)
+    print(f"linked this pane to {key}")
+
+
+def cmd_note(a):
+    """Set a task's short progress note (empty text clears it); default task: the one linked to this pane."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    with store() as data:
+        key = resolve(a.ref, a.repo) if a.ref else data["panes"].get(pane, {}).get("task") if pane else None
+        if key not in data["tasks"]:
+            sys.exit("no task: pass --ref or run this in a pane linked to a task")
+        t = data["tasks"][key]
+        if a.text.strip():
+            t["progress"] = a.text.strip()
+        else:
+            t.pop("progress", None)
+    print(f"{key}: {a.text.strip() or 'note cleared'}")
+
+
+def cmd_block(a):
+    """Move a task to Blocked / Postponed (with an optional reason), or back."""
+    with store() as data:
+        key = resolve(a.ref, a.repo)
+        if key not in data["tasks"]:
+            sys.exit(f"no task {key}")
+        if a.unblock:
+            data["tasks"][key].pop("blocked", None)
+        else:
+            data["tasks"][key]["blocked"] = a.reason.strip() or True
+    print(f"{key}: " + ("back on the board" if a.unblock else f"blocked / postponed{': ' + a.reason if a.reason else ''}"))
 
 
 def cmd_add(a):
@@ -185,51 +252,72 @@ def cmd_rm(a):
 
 
 def cmd_sync(a):
-    if ISSUES == "jira":
+    if ISSUES == "jira" and shutil.which("jira"):
         sync_jira(a.query or JQL)
-    elif ISSUES == "github":
+        sync_jira_closed()
+    elif ISSUES == "github" and shutil.which("gh"):
         sync_github(a.query or GH_QUERY)
+        sync_github_closed()
     sync_jira_done()
     sync_github_done()
     sync_prs()
 
 
+def watched(t):
+    """Tasks whose ticket status is kept fresh: not merged yet, or still listed under Done."""
+    cur = t["history"][-1]
+    return cur["status"] != "merged" or (datetime.now(timezone.utc) - datetime.fromisoformat(cur["at"])).days < DONE_DAYS
+
+
+def save_ticket_status(status, closed, note, bugs, mine):
+    """Store each ticket's tracker status, bug flag and whether someone else (or no one) is the assignee;
+    tickets closed in the tracker move to merged."""
+    with store() as data:
+        for key, name in status.items():
+            if key not in data["tasks"]:
+                continue
+            t = data["tasks"][key]
+            t["ticket_status"], t["ticket_closed"], t["bug"], t["shared"] = name, key in closed, bugs.get(key, False), key not in mine
+            if key in closed and t["history"][-1]["status"] != "merged":
+                transition(data, key, "merged", note=note)
+                print(f"{note}: {key}")
+
+
 def sync_github_done():
-    """Move tracked GitHub issues that were closed to merged, so they show under Done."""
-    issues = [(k, t) for k, t in load()["tasks"].items() if t.get("number") and t["history"][-1]["status"] != "merged"]
+    """Refresh the state of tracked GitHub issues; closed ones move to merged, so they show under Done."""
+    issues = [(k, t) for k, t in load()["tasks"].items() if t.get("number") and watched(t)]
     if not issues or not shutil.which("gh"):
         return
-    closed = []
+    me, status, bugs, mine = sh("gh", "api", "user", "-q", ".login", check=False).strip(), {}, {}, set()
     for key, t in issues:
-        r = subprocess.run(["gh", "issue", "view", str(t["number"]), "-R", t["repo"], "--json", "state", "-q", ".state"],
+        r = subprocess.run(["gh", "issue", "view", str(t["number"]), "-R", t["repo"], "--json", "state,labels,assignees"],
                            capture_output=True, text=True, stdin=subprocess.DEVNULL)
-        if r.stdout.strip() == "CLOSED":
-            closed.append(key)
-    with store() as data:
-        for key in closed:
-            if key in data["tasks"] and data["tasks"][key]["history"][-1]["status"] != "merged":
-                transition(data, key, "merged", note="closed on GitHub")
-    if closed:
-        print(f"closed on GitHub: {' '.join(closed)}")
+        if r.returncode == 0:
+            info = json.loads(r.stdout)
+            status[key], bugs[key] = info["state"].lower(), gh_bug(info)
+            if any(a["login"] == me for a in info["assignees"]):
+                mine.add(key)
+    save_ticket_status(status, {k for k, v in status.items() if v != "open"}, "closed on GitHub", bugs, mine)
 
 
 def sync_jira_done():
-    """Move tracked Jira tickets that are done in Jira to merged, so they show under Done."""
-    keys = [k for k, t in load()["tasks"].items() if label(k, t) == k and t["history"][-1]["status"] != "merged"]
+    """Refresh the status of tracked Jira tickets; done ones move to merged, so they show under Done."""
+    keys = [k for k, t in load()["tasks"].items() if label(k, t) == k and watched(t)]
     if not keys or not shutil.which("jira"):
         return
-    r = subprocess.run(["jira", "issue", "list", "-q", f"key in ({','.join(keys)}) AND statusCategory = Done", "--raw"],
-                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    try:
-        done = [i["key"] for i in json.loads(r.stdout)]
-    except ValueError:
-        done = []  # "No result found" or an error
-    with store() as data:
-        for key in done:
-            if key in data["tasks"] and data["tasks"][key]["history"][-1]["status"] != "merged":
-                transition(data, key, "merged", note="done in Jira")
-    if done:
-        print(f"done in Jira: {' '.join(done)}")
+
+    def query(jql):
+        r = subprocess.run(["jira", "issue", "list", "-q", jql, "--raw"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        try:
+            return json.loads(r.stdout)
+        except ValueError:
+            return []  # "No result found" or an error
+
+    keys = f"key in ({','.join(keys)})"
+    issues = query(keys)
+    status, bugs = {i["key"]: i["fields"]["status"]["name"] for i in issues}, {i["key"]: jira_bug(i["fields"]) for i in issues}
+    save_ticket_status(status, {i["key"] for i in query(keys + " AND statusCategory = Done")}, "done in Jira", bugs,
+                       {i["key"] for i in query(keys + " AND assignee = currentUser()")})
 
 
 FAILED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
@@ -248,7 +336,12 @@ def sync_prs():
         if r.returncode:
             continue
         pr, checked = json.loads(r.stdout), checked + 1
-        checks = pr["statusCheckRollup"] or []
+        latest = {}  # reruns leave older runs in the rollup; like GitHub, only the newest run of each check counts
+        for c in pr["statusCheckRollup"] or []:
+            name = (c.get("workflowName"), c.get("name") or c.get("context"))
+            if name not in latest or (c.get("startedAt") or "") >= (latest[name].get("startedAt") or ""):
+                latest[name] = c
+        checks = list(latest.values())
         results = {c.get("conclusion") or c.get("state") or "" for c in checks}
         ci = ("failing" if results & FAILED else
               "running" if any(c.get("status", "COMPLETED") != "COMPLETED" or c.get("state") in ("PENDING", "EXPECTED") for c in checks) else
@@ -265,11 +358,45 @@ def sync_prs():
     print(f"{checked} PRs checked, {merged} merged")
 
 
+def sync_github_closed():
+    """Add GitHub issues matching the query that were closed in the last DONE_DAYS, under Done."""
+    since = (datetime.now(timezone.utc) - timedelta(days=DONE_DAYS)).date().isoformat()
+    query = re.sub(r"\bstate:\S+", "", GH_QUERY) + f" state:closed closed:>={since}"
+    r = subprocess.run(["gh", "search", "issues", *shlex.split(query), "--json", "repository,number,title,url,labels,closedAt",
+                        "--limit", "100"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if r.returncode:
+        return
+    with store() as data:
+        for i in json.loads(r.stdout):
+            repo = i["repository"]["nameWithOwner"]
+            key = f"{repo}#{i['number']}"
+            if key not in data["tasks"]:
+                add_closed(data, key, dict(repo=repo, number=i["number"], title=i["title"], url=i["url"], bug=gh_bug(i),
+                                           ticket_status="closed", ticket_closed=True), utc(i["closedAt"]), "closed on GitHub")
+
+
+def sync_jira_closed():
+    """Add Jira issues matching DONE_JQL (done recently, assigned to or closed by you), under Done."""
+    r = subprocess.run(["jira", "issue", "list", "-q", DONE_JQL, "--raw"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    try:
+        issues = json.loads(r.stdout)
+    except ValueError:
+        return
+    base = next((t["url"].split("/browse/")[0] for k, t in load()["tasks"].items() if "/browse/" in t.get("url", "")), None)
+    with store() as data:
+        for i in issues:
+            key, f = i["key"], i["fields"]
+            if key not in data["tasks"]:
+                base = base or json.loads(sh("jira", "issue", "view", key, "--raw"))["self"].split("/rest/")[0]
+                add_closed(data, key, dict(title=f["summary"], url=f"{base}/browse/{key}", bug=jira_bug(f),
+                                           ticket_status=f["status"]["name"], ticket_closed=True), utc(f["updated"]), "done in Jira")
+
+
 def sync_github(query):
     """Add GitHub issues matching a search query that aren't tracked yet, and refresh titles."""
     if not shutil.which("gh"):
         return print("gh is not installed, skipping GitHub issues")
-    r = subprocess.run(["gh", "search", "issues", *shlex.split(query), "--json", "repository,number,title,url", "--limit", "100"],
+    r = subprocess.run(["gh", "search", "issues", *shlex.split(query), "--json", "repository,number,title,url,labels", "--limit", "100"],
                        capture_output=True, text=True, stdin=subprocess.DEVNULL)
     if r.returncode:
         return print(f"gh search issues: {r.stderr.strip()}", file=sys.stderr)
@@ -282,7 +409,7 @@ def sync_github(query):
                 data["tasks"][key] = dict(repo=repo, number=i["number"], title=i["title"], url=i["url"], history=[])
                 transition(data, key, "created")
                 added.append(key)
-            data["tasks"][key]["title"] = i["title"]
+            data["tasks"][key].update(title=i["title"], bug=gh_bug(i))
     print(f"{len(issues)} issues, added {len(added)}" + (f": {' '.join(added)}" if added else ""))
 
 
@@ -312,7 +439,7 @@ def sync_jira(jql):
                 data["tasks"][key] = dict(title=summary, url=f"{base}/browse/{key}", history=[])
                 transition(data, key, "created")
                 added.append(key)
-            data["tasks"][key]["title"] = summary
+            data["tasks"][key].update(title=summary, bug=jira_bug(i["fields"]))
     print(f"{len(issues)} issues, added {len(added)}" + (f": {' '.join(added)}" if added else ""))
 
 
@@ -457,7 +584,7 @@ def cmd_start(a):
     sh(HERDR, "agent", "start", name, "--kind", a.kind, "--pane", pane)
     sh(HERDR, "agent", "prompt", name, prompt + (
         f" Report your phase whenever it changes by running `{SELF} set <stage> {key}`: `research` while investigating, "
-        f"`code` once you change code, `testing` while verifying, `pr` once you open a PR (add `--pr <url>`). Never set `merged`."))
+        f"`code` once you change code, `pr` once you open a PR (add `--pr <url>`), `testing` once testing starts. Never set `merged`."))
     print(f"{key}: agent {name} started in {pane}")
 
 
@@ -497,19 +624,41 @@ def cmd_hook(a):
     except ValueError:
         inp = {}
     if a.event == "session":
+        data = load()
+        key = data["panes"].get(pane, {}).get("task")
+        t = data["tasks"].get(key)
+        linked = (f"\n- This tab is linked to {label(key, t)} ({t['title'].strip()}, stage {t['history'][-1]['status']}). "
+                  "If the conversation turns out to be about another ticket, link that one instead.") if t and label(key, t) else ""
         tickets = [f"{label(k, t)} {t['title'].strip()}"
                    for k, t in load()["tasks"].items() if label(k, t) and t["history"][-1]["status"] != "merged"]
-        return print(INSTRUCTIONS + ("\n- Open tickets on the board. If this work belongs to one, link to it with `set <stage> <ref>`; several tabs can share "
+        return print(INSTRUCTIONS + linked + ("\n- Open tickets on the board. If this work belongs to one, link to it with `set <stage> <ref>`; several tabs can share "
                         "a ticket and its stage:\n" + "\n".join(f"  {x}" for x in tickets) if tickets else ""))
     sid, prompt = inp.get("session_id"), " ".join(inp.get("prompt", "").split())
     if not prompt or re.fullmatch(r"/\S+", prompt):
         return
     with store() as data:
         b = data["panes"].get(pane)
-        if b and b.get("task") in data["tasks"] and b.get("session") in (None, sid):
+        t = data["tasks"].get((b or {}).get("task"))
+        # same session, or a new session (e.g. after /clear) in a tab on a ticket that's still open: keep the link
+        if t and (b.get("session") in (None, sid) or (label(b["task"], t) and t["history"][-1]["status"] != "merged")):
             b["session"] = sid
         else:
             data["panes"][pane] = dict(task=new_local(data, prompt[:60], pane, auto=True), session=sid)
+
+
+BUG, SHARED = "🐞", "👥"  # two columns wide in terminals
+
+
+def icons(t):
+    return [i for i, on in [(BUG, t.get("bug")), (SHARED, t.get("shared"))] if on]
+
+
+def name_cell(key, t, width):
+    """Left column: icons (bug, someone else's ticket) and the ticket ID, padded to `width`; also the column where the ID starts."""
+    lab = label(key, t) or ""
+    lead = "".join(i + " " for i in icons(t)) if lab else ""
+    off = 3 * len(icons(t)) if lab else 0
+    return lead + lab + " " * max(0, width - len(lab) - off), off
 
 
 def label(key, t):
@@ -571,7 +720,7 @@ def render(selected=None):
         cols = os.get_terminal_size(sys.stdout.fileno()).columns
     except OSError:
         cols = shutil.get_terminal_size().columns
-    x0 = max([len(label(k, t) or "") + 8 for k, t in tasks.items()] + [14])
+    x0 = max([len(label(k, t) or "") + 8 + 3 * len(icons(t)) for k, t in tasks.items()] + [14])
 
     def rail(name="", mark=False):
         """A spacer line: optional heading or selection mark, then a dotted rail under every stage."""
@@ -589,20 +738,41 @@ def render(selected=None):
         x = x0 + i * GAP - len(s) // 2
         header[x:x + len(s)] = s
     out, rows = ["".join(header).rstrip()], {}
-    sections = {}  # active tasks: furthest stage first, then most recent; Done: newest first
+    sections = {}  # active and blocked tasks: furthest stage first, then most recent; Done: newest first
     for key, t in sorted(tasks.items(), key=lambda kt: (STATUSES.index(kt[1]["history"][-1]["status"]), kt[1]["history"][-1]["at"]), reverse=True):
         cur = t["history"][-1]
         if cur["status"] != "merged":
-            sections.setdefault("", []).append((key, t))
+            sections.setdefault(BLOCKED_SECTION if t.get("blocked") else "", []).append((key, t))
         elif (datetime.now(timezone.utc) - datetime.fromisoformat(cur["at"])).days < DONE_DAYS:
             sections.setdefault(DONE_SECTION, []).append((key, t))
-    for section in sorted(sections, key=lambda p: p == DONE_SECTION):
-        done = section == DONE_SECTION  # a plain list under a divider: no stage rails, no tab lines
-        out += ["", DONE.format(f"✓ {DONE_SECTION} ") + DIM.format("─" * max(0, cols - len(DONE_SECTION) - 4)), ""] if done else []
+    for section in sorted(sections, key=[ "", BLOCKED_SECTION, DONE_SECTION].index):
+        done = section == DONE_SECTION  # a table under a divider: no stage rails, no tab lines
+        if section:
+            heading = DONE.format(f"✓ {DONE_SECTION} ") if done else f"\033[1;93m⏸ {BLOCKED_SECTION} \033[0m"
+            out += ["", heading + DIM.format("─" * max(0, cols - len(section) - 4)), ""]
+        DATE_W, PR_W, NOTE_W = 12, 9, 16  # Done table columns after the ID: title, date, PR, note
+        longest = max([len(t["title"].strip()) for _, t in sections[section]] + [5])
+        title_w = max(10, min(longest, 60, cols - 1 - x0 - DATE_W - PR_W - NOTE_W - 6))
+        if done:
+            out.append(DIM.format(" " * 4 + "ID".ljust(x0 - 4) + "Title".ljust(title_w + 2) + "Done".ljust(DATE_W + 2) + "PR".ljust(PR_W + 2) + "Ticket status"))
         for key, t in sections[section]:
             cur = t["history"][-1]
             mark = "\033[1m› \033[0m" if key == selected else "  "
-            n, row = STATUSES.index(cur["status"]), mark + f"  {label(key, t) or ''}".ljust(x0 - 2)
+            if done:
+                m = re.search(r"/pull/(\d+)", t.get("pr", ""))
+                pr = (f"PR #{m[1]}" if m else "PR") if t.get("pr") else ""
+                title = t["title"].strip()
+                title = title if len(title) <= title_w else title[:title_w - 1] + "…"
+                x_pr = x0 + title_w + 2 + DATE_W + 2
+                cell, off = name_cell(key, t, x0 - 4)
+                ticket = (t.get("url"), (4 + off, 4 + off + len(label(key, t)))) if label(key, t) and t.get("url") else (None, None)
+                rows[len(out)] = (key, live.get(last_pane(t), {}), t.get("pr"), (x_pr, x_pr + len(pr)) if pr else None, *ticket, None)
+                out.append(mark + "  " + cell + DIM.format(title.ljust(title_w + 2) + ago(cur["at"]).ljust(DATE_W + 2))
+                           + f"\033[36;4m{pr}\033[0m" + " " * (PR_W + 2 - len(pr))
+                           + (DIM if t.get("ticket_closed") else "\033[1;93m{}\033[0m").format(t.get("ticket_status", "")[:NOTE_W]))  # yellow: still open
+                continue
+            cell, off = name_cell(key, t, x0 - 4)
+            n, row = STATUSES.index(cur["status"]), mark + "  " + cell
             for i, s in enumerate(STATUSES if not done else []):
                 if i:
                     row += DONE.format("━" * (GAP - 1)) if i <= n else DIM.format("─" * (GAP - 1))
@@ -619,14 +789,15 @@ def render(selected=None):
             ps = t.get("pr_status", {}) if pr and cur["status"] != "merged" else {}
             prs = [p for p in [ps.get("review"), ps.get("ci") and f"CI {ps['ci']}", ps.get("state") == "closed" and "PR closed"] if p]
             start = START if label(key, t) and cur["status"] == "created" and not pane else None
-            rest = [p for p in [ago(cur['at']), pr, *prs, cur.get("note"),
+            note = (t.get("blocked") and t["blocked"] is not True and f"⏸ {t['blocked']}") or (t.get("progress") and f"✎ {t['progress']}")
+            rest = [p for p in [ago(cur['at']), note, pr, *prs,
                                 AGENT_ICONS.get(agent) if pane else start or "no tab"] if p]
             fit = room - x - 2 - sum(len(p) + 3 for p in rest)  # shorten the title so the PR link and status stay visible
             title = title.strip() if len(title.strip()) <= fit else title.strip()[:max(fit - 1, 10)] + "…"
             for piece in [title] + rest:
                 text = (" · " if info else "  ") + piece
                 fits = text[:max(0, room - x)]
-                style = PR_STYLES.get(piece)
+                style = "\033[3;97m{}\033[0m" if piece is note else PR_STYLES.get(piece)  # the note stands out from the dim text
                 if piece is start and len(fits) == len(text):
                     start_span = (x + len(text) - len(start), x + len(text))
                     info += DIM.format(text[:-len(start)]) + f"\033[1;92m{start}\033[0m"
@@ -638,7 +809,7 @@ def render(selected=None):
                 else:
                     info += DIM.format(fits)
                 x += len(fits)
-            ticket = (t.get("url"), (4, 4 + len(label(key, t)))) if label(key, t) and t.get("url") else (None, None)
+            ticket = (t.get("url"), (4 + off, 4 + off + len(label(key, t)))) if label(key, t) and t.get("url") else (None, None)
             if not done:
                 out.append(rail())
             rows[len(out)] = (key, pane, t.get("pr"), span, *ticket, start_span)
@@ -779,6 +950,17 @@ for name, fn, help in [("add", cmd_add, "track a ticket without starting an agen
 sub.choices["start"].add_argument("--kind", default="claude")
 sub.choices["start"].add_argument("--direction", choices=["right", "down"], default="right")
 sub.choices["start"].add_argument("--workspace", action="store_true", help="open a new workspace in DASHBOARD_START_DIR instead of splitting this pane")
+s = cmd("note", cmd_note, "set a task's short progress note (\"\" clears it)")
+s.add_argument("text")
+s.add_argument("--ref", help=REF)
+s = cmd("block", cmd_block, "move a task to Blocked / Postponed")
+s.add_argument("ref", help=REF)
+s.add_argument("reason", nargs="?", default="")
+s.set_defaults(unblock=False)
+s = cmd("unblock", cmd_block, "move a task back from Blocked / Postponed")
+s.add_argument("ref", help=REF)
+s.set_defaults(unblock=True, reason="")
+cmd("link", cmd_link, "link this pane to a ticket without changing its stage").add_argument("ref", help=REF)
 cmd("sync", cmd_sync, "add issues from the tracker chosen in setup and refresh PR status").add_argument("--query", help="override the saved GitHub query or Jira JQL")
 cmd("setup", cmd_setup, "put dashboard on PATH and add the Claude Code hooks").add_argument("--wait", action="store_true")
 cmd("rm", cmd_rm, "stop tracking a task").add_argument("ref", help=REF)

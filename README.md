@@ -4,8 +4,8 @@ A task board for [Herdr](https://herdr.dev): your GitHub issues, Jira tickets an
 from `created` to `merged`, with the tabs working on each one.
 
 ```
-              created  research    code     testing     pr      merged
-    PROJ-142     ●━━━━━━━━━●━━━━━━━━━●━━━━━━━━━●━━━━━━━━━●─────────○  Retry failed uploads · 2h · PR #318 · CI failing
+              created  research    code       pr      testing   merged
+    PROJ-142     ●━━━━━━━━━●━━━━━━━━━●━━━━━━━━━●━━━━━━━━━●─────────○  Retry failed uploads · 2h · ✎ testing on staging · PR #318
                  ┆         ┆         ┆         ┆         ┆         ┆  ↳ ◐ upload retry backoff
     api#57       ●━━━━━━━━━●━━━━━━━━━●─────────○─────────○─────────○  Rate limit headers · 40m
     PROJ-150     ●─────────○─────────○─────────○─────────○─────────○  Dark mode toggle · Oct 7 (Wed) · ▶ start

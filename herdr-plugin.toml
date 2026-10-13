@@ -2,7 +2,7 @@ id = "simpikkle.dashboard"
 name = "Dashboard"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
-description = "Track GitHub issues, Jira tickets and untitled work through created → research → code → testing → pr → merged"
+description = "Track GitHub issues, Jira tickets and untitled work through created → research → code → pr → testing → merged"
 platforms = ["linux", "macos"]
 
 [[panes]]
